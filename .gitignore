@@ -1,0 +1,14 @@
+# Exclude Python virtual environment
+.venv/
+.claude/
+
+
+# Exclude local cache and analysis files
+local_eventworx_projects.json
+local_notion_projects.json
+all_eventworx_raw.json
+
+
+# Credentials
+.env
+
