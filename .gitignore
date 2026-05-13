@@ -11,4 +11,5 @@ all_eventworx_raw.json
 
 # Credentials
 .env
+env.txt
 
