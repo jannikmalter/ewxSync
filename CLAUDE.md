@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ewxSync** synchronizes Eventworx (event management SaaS) job data into a Notion database. It also contains a Discord bot that mirrors channel events to Notion.
+**ewxSync** synchronizes Eventworx (event management SaaS) job data into Notion and Discord. Each sync pass fetches fresh data from all three services, diffs locally, and pushes only changes.
+
+`notionDiscord.py` is an old prototype (Discord bot that mirrored new channels to Notion) and is no longer the active approach. All sync logic lives in `ewxSync.py`.
 
 ## Running Scripts
 
@@ -12,27 +14,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Activate the virtual environment first
 source .venv/bin/activate
 
-# Main sync script (project-level, current)
+# Main sync script
 python ewxSync.py
-
-# Discord → Notion bot
-python notionDiscord.py
-
-
 ```
 
 No build step, test runner, or linter is configured.
 
 ## Architecture
 
-### Two sync approaches
+### Sync model
 
-**`ewxSync.py`** (current, project-level):
+`ewxSync.py`:
 - Groups all Eventworx documents by `projectNumber` into `ProjectSummary` objects
 - `classify_project()` determines status and picks the representative doc using the same logic Eventworx's UI uses for its "active orders/offers" views — status sets per docType, `activation != archived`, `dealType = rent`, and `endDate > now` for offers
 - Status → 3 values: `Aktiv` (live order or offer exists), `Abgeschlossen` (closed), `Storniert` (cancelled)
 - Categories are merged across all docs in the project (union, sorted)
 - Syncs to Notion using the newer `notion.data_sources` API (notion-client v3)
+- Syncs to Discord by updating channel topics with Eventworx URLs
 - `meaningful_diffs()` prevents overwriting existing Notion values with empty/null data from Eventworx
 
 Active status sets (derived from Eventworx's own filter requests, see `eventworx API  analysis.md`):
@@ -41,12 +39,18 @@ Active status sets (derived from Eventworx's own filter requests, see `eventworx
 
 **Offer variant deduplication**: multiple offer variants share the same `jobNumber` (e.g. AN-1073-01, AN-1073-02) and both appear as separate rows in the API response, both with `activation=null`. Before evaluating live offers, `classify_project()` deduplicates by `jobNumber`, keeping only the most recently modified variant. This prevents a rejected variant 2 from being hidden while the older variant 1 (still `sent`) incorrectly marks the project as Aktiv.
 
-### Data flow (ewxSync.py)
+### Data flow
 
 ```
 Eventworx login → fetch categories → fetch all docs (paginated, 50/page)
-  → aggregate_projects() → compare with local_eventworx_projects.json
-  → fetch existing Notion entries → upsert changed projects → save local cache
+  → aggregate_projects() → save local_eventworx_projects.json
+
+Notion: fetch existing entries → save local_notion_projects.json
+Discord: fetch tagged channels → save local_discord_channels.json
+
+For each project:
+  → diff against Notion  → upsert Notion page
+  → diff against Discord → update channel topic if EWX link changed
 ```
 
 ### Local cache files (git-ignored)
@@ -55,6 +59,7 @@ Eventworx login → fetch categories → fetch all docs (paginated, 50/page)
 |---|---|
 | `local_eventworx_projects.json` | Previous sync state for ewxSync.py |
 | `local_notion_projects.json` | Snapshot of current Notion DB state |
+| `local_discord_channels.json` | Snapshot of current Discord channel state |
 | `all_eventworx_raw.json` | Raw API response dump (written every run) |
 
 ### Key data model details
@@ -63,10 +68,18 @@ Eventworx login → fetch categories → fetch all docs (paginated, 50/page)
 - Eventworx timestamps are in **milliseconds** — divide by 1000 for Unix seconds
 - Both timestamp normalizers truncate to the minute to avoid jitter-based spurious diffs
 - `force_notion_sync = True` bypasses the local cache check and always syncs
+- `Document.docId` holds the Eventworx document UUID used to build deep-link URLs
+- `ProjectSummary.representativeUrl` is the Eventworx URL for the representative doc — embedded as `text.link` on the Notion `Project Number` field and written into the Discord channel topic EWX tag
+- `ProjectSummary.notionUrl` is read from Notion and stored in the cache; never written back or diffed
+- `DiscordChannel` stores `channelId`, `channelName`, `projectNumber`, `eventworxUrl` (from topic), and the full raw `topic` string
 
-### Notion database fields (ewxSync.py)
+### Notion database fields
 
-`Title`, `Project Number` (rich_text), `Status` (select), `Representative Job` (rich_text), `Representative Type` (select), `Current Price` (number), `Rent` (date range), `Categories` (multi_select), `Has Order/Offer/Request/Delivery/Invoice` (checkboxes)
+`Title`, `Project Number` (rich_text, hyperlinked to Eventworx representative doc), `Status` (select), `Representative Job` (rich_text), `Representative Type` (select), `Current Price` (number), `Rent` (date range), `Categories` (multi_select), `Has Order/Offer/Request/Delivery/Invoice` (checkboxes)
+
+### Discord channel identification
+
+Relevant channels carry a `[EWX:P-XXXX]` tag in their topic — this is the join key between Discord and Eventworx. The sync script finds these channels via `_EWX_TAG_RE`, extracts the project number and any existing URL, then updates the tag to `[EWX:P-XXXX](eventworx-url)` when the URL is missing or stale. Discord supports `[text](url)` markdown in channel topics.
 
 ### Eventworx auth
 
@@ -75,7 +88,7 @@ Login uses `license: READONLY` to avoid consuming a full user license. The `X-AU
 ## Dependencies
 
 ```bash
-pip install requests notion-client discord.py
+pip install requests notion-client discord.py python-dotenv
 ```
 
 Python 3.10+ required (uses `int | None` union syntax in ewxSync.py).

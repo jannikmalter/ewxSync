@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from dataclasses import dataclass, asdict
-import time, json, logging, requests, sys, os
+import time, json, logging, requests, sys, os, re
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from notion_client import Client
@@ -23,6 +23,14 @@ LOCAL_CACHE = "local_eventworx_projects.json"
 
 USERNAME = os.getenv("EVENTWORX_USERNAME")
 PASSWORD = os.getenv("EVENTWORX_PASSWORD")
+
+DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DISCORD_API_BASE = "https://discord.com/api/v10"
+DISCORD_CACHE    = "local_discord_channels.json"
+
+_EWX_TAG_RE = re.compile(r'\[EWX:(P-\d+)\](?:\(([^)]+)\))?')
+_NOTION_TAG_RE = re.compile(r'\[Notion\]\(([^)]+)\)')
 
 COMMON_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
@@ -58,6 +66,7 @@ class Document:
     endDate: int | None     # raw ms timestamp — used to check if an offer period has passed
     rentStartDate: str | None
     rentEndDate: str | None
+    docId: str = ""
     jobCategoryNames: list[str] = None
 
 @dataclass
@@ -77,12 +86,23 @@ class ProjectSummary:
     has_delivery: bool = False
     has_invoice: bool = False
     icon: str | None = None  # URL or emoji string if a Notion icon is set; None means no icon
+    representativeUrl: str | None = None
+    notionUrl: str | None = None  # read-only — never written back to Notion, never diffed
 
     def __post_init__(self):
         if self.categories is None:
             self.categories = []
         if not isinstance(self.categories, list):
             self.categories = []
+
+@dataclass
+class DiscordChannel:
+    channelId: str
+    channelName: str
+    projectNumber: str
+    eventworxUrl: str | None = None
+    notionUrl: str | None = None
+    topic: str | None = None
 
 
 # --------------- HELPERS ---------------
@@ -110,7 +130,8 @@ def normalize_notion_datetime(dt_str: str | None) -> str | None:
 def make_project_summary(projectNumber, title, status, currentPrice, rentStartDate, rentEndDate,
                          representativeJob, representativeDocType, categories=None,
                          has_order=False, has_offer=False, has_request=False,
-                         has_delivery=False, has_invoice=False, icon=None):
+                         has_delivery=False, has_invoice=False, icon=None,
+                         representativeUrl=None, notionUrl=None):
     if not isinstance(categories, list):
         categories = []
     return ProjectSummary(
@@ -129,6 +150,8 @@ def make_project_summary(projectNumber, title, status, currentPrice, rentStartDa
         has_delivery=bool(has_delivery),
         has_invoice=bool(has_invoice),
         icon=icon or None,
+        representativeUrl=representativeUrl or None,
+        notionUrl=notionUrl or None,
     )
 
 def _first_non_null(docs: list[Document], attr: str):
@@ -222,6 +245,9 @@ def aggregate_projects(all_docs: list[Document]) -> list[ProjectSummary]:
         rent_start = rep.rentStartDate or _first_non_null(docs, "rentStartDate")
         rent_end   = rep.rentEndDate   or _first_non_null(docs, "rentEndDate")
 
+        rep_url = (f"{EVENTWORX_BASE}/eventworx/#job/edit/{rep.docType}/{rep.docId}"
+                   if rep.docId else None)
+
         summaries.append(ProjectSummary(
             projectNumber=pn,
             title=rep.title or f"Project {pn}",
@@ -237,6 +263,7 @@ def aggregate_projects(all_docs: list[Document]) -> list[ProjectSummary]:
             has_request="request"   in doc_types,
             has_delivery="deliverynote" in doc_types,
             has_invoice="invoice"   in doc_types,
+            representativeUrl=rep_url,
         ))
     return summaries
 
@@ -323,6 +350,7 @@ def fetch_all_docs(session, token) -> list[Document]:
                 endDate=e.get("endDate"),
                 rentStartDate=normalize_eventworx_datetime(e.get("rentStartDate")),
                 rentEndDate=normalize_eventworx_datetime(e.get("rentEndDate")),
+                docId=e.get("id", ""),
                 jobCategoryNames=[category_map[cid] for cid in category_ids
                                   if cid in category_map],
             ))
@@ -427,6 +455,7 @@ def fetch_existing_notion_entries(data_source_id: str):
                     rentStartDate=normalize_notion_datetime(get_nested(props, ["Rent", "date", "start"], None)),
                     rentEndDate=normalize_notion_datetime(get_nested(props, ["Rent", "date", "end"], None)),
                     representativeJob=get_nested(props, ["Representative Job", "rich_text", 0, "text", "content"], ""),
+                    representativeUrl=get_nested(props, ["Project Number", "rich_text", 0, "text", "link", "url"], None),
                     representativeDocType=get_nested(props, ["Representative Type", "select", "name"], ""),
                     categories=sorted([c.get("name") for c in categories_raw
                                        if isinstance(c, dict) and c.get("name")]),
@@ -436,6 +465,7 @@ def fetch_existing_notion_entries(data_source_id: str):
                     has_delivery=get_nested(props, ["Has Delivery", "checkbox"], False),
                     has_invoice=get_nested(props, ["Has Invoice", "checkbox"], False),
                     icon=icon_str,
+                    notionUrl="https://www.notion.so/" + page["id"].replace("-", ""),
                 )
             }
         if not resp.get("has_more"):
@@ -456,7 +486,10 @@ def page_icon(p: ProjectSummary) -> dict | None:
 def build_notion_props(p: ProjectSummary) -> dict:
     props = {
         "Title":               {"title": [{"text": {"content": p.title or "Untitled"}}]},
-        "Project Number":      {"rich_text": [{"text": {"content": p.projectNumber}}]},
+        "Project Number":      {"rich_text": [{"text": {
+            "content": p.projectNumber,
+            **({"link": {"url": p.representativeUrl}} if p.representativeUrl else {}),
+        }}]},
         "Status":              {"select": {"name": p.status or ""}},
         "Representative Job":  {"rich_text": [{"text": {"content": p.representativeJob}}]},
         "Representative Type": {"select": {"name": p.representativeDocType}},
@@ -513,6 +546,72 @@ def save_notion_local(existing: dict):
         json.dump([asdict(e["obj"]) for e in existing.values()], f, ensure_ascii=False, indent=2)
 
 
+# --------------- DISCORD ---------------
+def fetch_discord_channels() -> list[DiscordChannel]:
+    logging.info("Fetching Discord channels…")
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
+    r = requests.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/channels", headers=headers)
+    r.raise_for_status()
+    channels = []
+    for ch in r.json():
+        if ch.get("type") != 0:          # text channels only
+            continue
+        topic = ch.get("topic") or ""
+        m = _EWX_TAG_RE.search(topic)
+        if not m:
+            continue
+        notion_m = _NOTION_TAG_RE.search(topic)
+        channels.append(DiscordChannel(
+            channelId=str(ch["id"]),
+            channelName=ch["name"],
+            projectNumber=m.group(1),
+            eventworxUrl=m.group(2) or None,
+            notionUrl=notion_m.group(1) if notion_m else None,
+            topic=topic,
+        ))
+    logging.info("Found %d Discord channels with EWX tags.", len(channels))
+    return channels
+
+def save_discord_local(channels: list[DiscordChannel]):
+    with open(DISCORD_CACHE, "w", encoding="utf-8") as f:
+        json.dump([asdict(c) for c in channels], f, ensure_ascii=False, indent=2)
+
+def load_discord_local() -> list[DiscordChannel]:
+    if not os.path.exists(DISCORD_CACHE):
+        return []
+    with open(DISCORD_CACHE, "r", encoding="utf-8") as f:
+        return [DiscordChannel(**c) for c in json.load(f)]
+
+def build_discord_topic(old_topic: str | None, project_number: str,
+                        ewx_url: str | None, notion_url: str | None) -> str:
+    """Rebuild a topic with up-to-date EWX and Notion tags.
+
+    The EWX tag is always rewritten in place. The Notion tag is updated in place if
+    present, otherwise inserted directly after the EWX tag. Surrounding free-form
+    topic text is preserved.
+    """
+    topic = old_topic or ""
+    new_ewx_tag = (f"[EWX:{project_number}]({ewx_url})" if ewx_url
+                   else f"[EWX:{project_number}]")
+    topic = _EWX_TAG_RE.sub(lambda _: new_ewx_tag, topic, count=1)
+
+    if notion_url:
+        new_notion_tag = f"[Notion]({notion_url})"
+        if _NOTION_TAG_RE.search(topic):
+            topic = _NOTION_TAG_RE.sub(new_notion_tag, topic, count=1)
+        else:
+            topic = topic.replace(new_ewx_tag, f"{new_ewx_tag} {new_notion_tag}", 1)
+    return topic
+
+
+def update_discord_topic(channel_id: str, new_topic: str):
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}",
+               "Content-Type": "application/json"}
+    r = requests.patch(f"{DISCORD_API_BASE}/channels/{channel_id}",
+                       headers=headers, json={"topic": new_topic})
+    r.raise_for_status()
+
+
 # ---------------- MAIN ----------------
 def main():
     session = auth_token = None
@@ -531,11 +630,18 @@ def main():
         existing = fetch_existing_notion_entries(data_source_id)
         save_notion_local(existing)
 
-        logging.info("Syncing %d projects with Notion…", len(projects))
+        discord_channels = fetch_discord_channels()
+        save_discord_local(discord_channels)
+        discord_by_project = {ch.projectNumber: ch for ch in discord_channels}
+
+        logging.info("Syncing %d projects…", len(projects))
         for p in projects:
+            # --- Notion ---
             props = build_notion_props(p)
+            notion_url: str | None = None
             if p.projectNumber in existing:
                 entry = existing[p.projectNumber]
+                notion_url = entry["obj"].notionUrl
                 mdiffs = meaningful_diffs(entry["obj"], p)
                 # Set icon only if none is set yet — don't overwrite manually chosen icons.
                 desired_icon = page_icon(p) if entry["obj"].icon is None else None
@@ -543,17 +649,37 @@ def main():
                     notion_call(notion.pages.update, page_id=entry["page_id"],
                                 properties=props,
                                 **({"icon": desired_icon} if desired_icon else {}))
-                    logging.info("Updated  %s (%s)", p.projectNumber, p.representativeJob)
+                    logging.info("Updated  Notion  %s (%s)", p.projectNumber, p.representativeJob)
                     logging.debug("  Changes: %s", mdiffs)
                 else:
-                    logging.info("Unchanged %s", p.projectNumber)
+                    logging.info("Unchanged Notion %s", p.projectNumber)
             else:
                 # New page — no existing icon, set one if the category warrants it.
                 icon = page_icon(p)
-                notion_call(notion.pages.create, parent={"data_source_id": data_source_id},
-                            properties=props,
-                            **({"icon": icon} if icon else {}))
-                logging.info("Created  %s (%s)", p.projectNumber, p.representativeJob)
+                created = notion_call(notion.pages.create,
+                                      parent={"data_source_id": data_source_id},
+                                      properties=props,
+                                      **({"icon": icon} if icon else {}))
+                if isinstance(created, dict) and created.get("id"):
+                    notion_url = "https://www.notion.so/" + created["id"].replace("-", "")
+                logging.info("Created  Notion  %s (%s)", p.projectNumber, p.representativeJob)
+
+            # --- Discord ---
+            ch = discord_by_project.get(p.projectNumber)
+            if ch:
+                ewx_changed    = p.representativeUrl and ch.eventworxUrl != p.representativeUrl
+                notion_changed = notion_url and ch.notionUrl != notion_url
+                if ewx_changed or notion_changed:
+                    new_topic = build_discord_topic(
+                        ch.topic, p.projectNumber,
+                        p.representativeUrl or ch.eventworxUrl,
+                        notion_url or ch.notionUrl,
+                    )
+                    update_discord_topic(ch.channelId, new_topic)
+                    logging.info("Updated  Discord %s → EWX=%s Notion=%s",
+                                 p.projectNumber,
+                                 "set" if ewx_changed else "unchanged",
+                                 "set" if notion_changed else "unchanged")
 
         save_local(projects)
     finally:

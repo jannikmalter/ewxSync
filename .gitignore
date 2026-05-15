@@ -1,17 +1,30 @@
-# Exclude Python virtual environment
+# Virtual environments
 .venv/
+.venv_*/
+venv/
+
+# Python build/cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Editor / IDE / agent state
+.vscode/
+.idea/
 .claude/
 
+# Resilio Sync versioning
+.filerun.versioning/
 
-# Exclude local cache and analysis files
-local_eventworx_projects.json
-local_notion_projects.json
-local_discord_channels.json
-local_eventworx_slim.json
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local cache & raw API dumps
+local_*.json
 all_eventworx_raw.json
-
 
 # Credentials
 .env
 env.txt
-
