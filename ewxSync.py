@@ -9,6 +9,8 @@ from notion_client.errors import APIResponseError
 load_dotenv()
 
 force_notion_sync = False
+# When True, log every Discord write but make no API call (channel topics + thread sync).
+dry_run = False
 
 
 logging.basicConfig(level=logging.INFO,
@@ -26,11 +28,19 @@ PASSWORD = os.getenv("EVENTWORX_PASSWORD")
 
 DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+DISCORD_VERMIETUNGEN_CHANNEL_ID = os.getenv("DISCORD_VERMIETUNGEN_CHANNEL_ID")
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_CACHE    = "local_discord_channels.json"
+DISCORD_THREADS_CACHE = "local_discord_threads.json"
+
+# Thread names start with the project number so we can join threads to projects
+# without persisting any IDs: e.g. "P-1234_Sommerfest Müller".
+THREAD_NAME_MAX = 100  # Discord channel/thread name limit
+THREAD_AUTO_ARCHIVE_MINUTES = 10080  # 7 days — Discord allows 60/1440/4320/10080
 
 _EWX_TAG_RE = re.compile(r'\[EWX:(P-\d+)\](?:\(([^)]+)\))?')
 _NOTION_TAG_RE = re.compile(r'\[Notion\]\(([^)]+)\)')
+_THREAD_PREFIX_RE = re.compile(r'^(P-\d+)_')
 
 COMMON_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
@@ -103,6 +113,13 @@ class DiscordChannel:
     eventworxUrl: str | None = None
     notionUrl: str | None = None
     topic: str | None = None
+
+@dataclass
+class DiscordThread:
+    threadId: str
+    threadName: str
+    projectNumber: str
+    archived: bool = False
 
 
 # --------------- HELPERS ---------------
@@ -612,6 +629,205 @@ def update_discord_topic(channel_id: str, new_topic: str):
     r.raise_for_status()
 
 
+# --------------- DISCORD THREADS (vermietungen) ---------------
+def _discord_headers() -> dict:
+    return {"Authorization": f"Bot {DISCORD_TOKEN}",
+            "Content-Type": "application/json"}
+
+def _parse_thread(raw: dict) -> DiscordThread | None:
+    name = raw.get("name") or ""
+    m = _THREAD_PREFIX_RE.match(name)
+    if not m:
+        return None
+    meta = raw.get("thread_metadata") or {}
+    return DiscordThread(
+        threadId=str(raw["id"]),
+        threadName=name,
+        projectNumber=m.group(1),
+        archived=bool(meta.get("archived", False)),
+    )
+
+def fetch_active_threads(channel_id: str) -> list[DiscordThread]:
+    """Return non-archived threads in the given channel whose name starts with P-XXXX_."""
+    r = requests.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/threads/active",
+                     headers=_discord_headers())
+    r.raise_for_status()
+    threads = []
+    for raw in r.json().get("threads", []):
+        if str(raw.get("parent_id")) != str(channel_id):
+            continue
+        t = _parse_thread(raw)
+        if t:
+            threads.append(t)
+    logging.info("Found %d active vermietungen threads.", len(threads))
+    return threads
+
+def fetch_archived_threads(channel_id: str) -> list[DiscordThread]:
+    """Return archived public threads in the given channel with a P-XXXX_ prefix.
+    Paginates via the `before` timestamp until `has_more` is false."""
+    headers = _discord_headers()
+    threads, before = [], None
+    while True:
+        params = {"limit": 100}
+        if before:
+            params["before"] = before
+        r = requests.get(f"{DISCORD_API_BASE}/channels/{channel_id}/threads/archived/public",
+                         headers=headers, params=params)
+        r.raise_for_status()
+        body = r.json()
+        page = body.get("threads", [])
+        for raw in page:
+            t = _parse_thread(raw)
+            if t:
+                threads.append(t)
+        if not body.get("has_more") or not page:
+            break
+        # Page by the oldest archive_timestamp in this page.
+        last = page[-1].get("thread_metadata", {}).get("archive_timestamp")
+        if not last:
+            break
+        before = last
+    return threads
+
+def build_thread_name(project_number: str, title: str) -> str:
+    title = (title or "").strip() or "Untitled"
+    name = f"{project_number}_{title}"
+    if len(name) > THREAD_NAME_MAX:
+        name = name[:THREAD_NAME_MAX]
+    return name
+
+def create_thread(channel_id: str, name: str) -> DiscordThread | None:
+    """Create a public thread without a starter message. Returns the parsed thread or None."""
+    payload = {
+        "name": name,
+        "type": 11,  # PUBLIC_THREAD
+        "auto_archive_duration": THREAD_AUTO_ARCHIVE_MINUTES,
+    }
+    r = requests.post(f"{DISCORD_API_BASE}/channels/{channel_id}/threads",
+                      headers=_discord_headers(), json=payload)
+    r.raise_for_status()
+    return _parse_thread(r.json())
+
+def archive_thread(thread_id: str):
+    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+                       headers=_discord_headers(), json={"archived": True})
+    r.raise_for_status()
+
+def unarchive_thread(thread_id: str, name: str | None = None):
+    """Unarchive a thread, optionally renaming it in the same PATCH."""
+    payload: dict = {"archived": False}
+    if name is not None:
+        payload["name"] = name
+    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+                       headers=_discord_headers(), json=payload)
+    r.raise_for_status()
+
+def rename_thread(thread_id: str, name: str):
+    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+                       headers=_discord_headers(), json={"name": name})
+    r.raise_for_status()
+
+def save_discord_threads_local(threads: list[DiscordThread]):
+    with open(DISCORD_THREADS_CACHE, "w", encoding="utf-8") as f:
+        json.dump([asdict(t) for t in threads], f, ensure_ascii=False, indent=2)
+
+
+def sync_vermietungen_threads(projects: list[ProjectSummary]):
+    """Reconcile threads in the vermietungen channel against Aktiv+Technikmiete projects.
+
+    - Project in target set, no active thread → unarchive an existing one if found, else create.
+    - Active thread, project not in target set → archive.
+    - Active thread in target set with stale name → rename.
+    """
+    if not DISCORD_VERMIETUNGEN_CHANNEL_ID:
+        logging.info("DISCORD_VERMIETUNGEN_CHANNEL_ID not set — skipping thread sync.")
+        return
+
+    channel_id = DISCORD_VERMIETUNGEN_CHANNEL_ID
+    target = {p.projectNumber: p for p in projects
+              if p.status == "Aktiv" and "Technikmiete" in (p.categories or [])}
+
+    active = fetch_active_threads(channel_id)
+    active_by_pn: dict[str, DiscordThread] = {}
+    for t in active:
+        # Defensively keep the first thread we see for a given PN; log if duplicates exist.
+        if t.projectNumber in active_by_pn:
+            logging.warning("Duplicate active thread for %s: %s and %s",
+                            t.projectNumber, active_by_pn[t.projectNumber].threadName, t.threadName)
+            continue
+        active_by_pn[t.projectNumber] = t
+
+    archived_by_pn: dict[str, DiscordThread] | None = None
+    def archived_index() -> dict[str, DiscordThread]:
+        nonlocal archived_by_pn
+        if archived_by_pn is None:
+            archived = fetch_archived_threads(channel_id)
+            archived_by_pn = {}
+            for t in archived:
+                # Keep the most recently archived (first in API response) per PN.
+                archived_by_pn.setdefault(t.projectNumber, t)
+        return archived_by_pn
+
+    final_state: dict[str, DiscordThread] = {}
+
+    # Pass 1: ensure each target project has an active thread with the right name.
+    for pn, p in target.items():
+        desired_name = build_thread_name(pn, p.title)
+        existing = active_by_pn.get(pn)
+        if existing:
+            if existing.threadName != desired_name:
+                if dry_run:
+                    logging.info("[DRY-RUN] Would rename thread %s: %r → %r",
+                                 pn, existing.threadName, desired_name)
+                else:
+                    rename_thread(existing.threadId, desired_name)
+                    existing.threadName = desired_name
+                    logging.info("Renamed thread %s → %s", pn, desired_name)
+            final_state[pn] = existing
+            continue
+
+        archived_match = archived_index().get(pn)
+        if archived_match:
+            name_arg = desired_name if archived_match.threadName != desired_name else None
+            if dry_run:
+                logging.info("[DRY-RUN] Would unarchive thread %s (%s)%s",
+                             pn, archived_match.threadName,
+                             f" and rename to {desired_name!r}" if name_arg else "")
+            else:
+                unarchive_thread(archived_match.threadId, name_arg)
+                archived_match.archived = False
+                if name_arg:
+                    archived_match.threadName = name_arg
+                final_state[pn] = archived_match
+                logging.info("Unarchived thread %s (%s)", pn, archived_match.threadName)
+            continue
+
+        if dry_run:
+            logging.info("[DRY-RUN] Would create thread %s (%s)", pn, desired_name)
+        else:
+            created = create_thread(channel_id, desired_name)
+            if created:
+                final_state[pn] = created
+                logging.info("Created thread %s (%s)", pn, desired_name)
+
+    # Pass 2: archive active threads whose project is no longer in the target set.
+    for pn, t in active_by_pn.items():
+        if pn in target:
+            continue
+        if dry_run:
+            logging.info("[DRY-RUN] Would archive thread %s (%s)", pn, t.threadName)
+        else:
+            archive_thread(t.threadId)
+            t.archived = True
+            final_state[pn] = t
+            logging.info("Archived thread %s (%s)", pn, t.threadName)
+
+    if dry_run:
+        logging.info("[DRY-RUN] Skipping save of %s.", DISCORD_THREADS_CACHE)
+    else:
+        save_discord_threads_local(list(final_state.values()))
+
+
 # ---------------- MAIN ----------------
 def main():
     session = auth_token = None
@@ -675,11 +891,19 @@ def main():
                         p.representativeUrl or ch.eventworxUrl,
                         notion_url or ch.notionUrl,
                     )
-                    update_discord_topic(ch.channelId, new_topic)
-                    logging.info("Updated  Discord %s → EWX=%s Notion=%s",
-                                 p.projectNumber,
-                                 "set" if ewx_changed else "unchanged",
-                                 "set" if notion_changed else "unchanged")
+                    if dry_run:
+                        logging.info("[DRY-RUN] Would update Discord topic %s → EWX=%s Notion=%s",
+                                     p.projectNumber,
+                                     "set" if ewx_changed else "unchanged",
+                                     "set" if notion_changed else "unchanged")
+                    else:
+                        update_discord_topic(ch.channelId, new_topic)
+                        logging.info("Updated  Discord %s → EWX=%s Notion=%s",
+                                     p.projectNumber,
+                                     "set" if ewx_changed else "unchanged",
+                                     "set" if notion_changed else "unchanged")
+
+        sync_vermietungen_threads(projects)
 
         save_local(projects)
     finally:

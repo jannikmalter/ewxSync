@@ -51,6 +51,12 @@ Discord: fetch tagged channels → save local_discord_channels.json
 For each project:
   → diff against Notion  → upsert Notion page
   → diff against Discord → update channel topic if EWX link changed
+
+After per-project sync:
+  → sync_vermietungen_threads(projects)
+    → create/unarchive/rename threads for Aktiv+Technikmiete projects
+    → archive threads whose project left the target set
+    → save local_discord_threads.json
 ```
 
 ### Local cache files (git-ignored)
@@ -60,6 +66,7 @@ For each project:
 | `local_eventworx_projects.json` | Previous sync state for ewxSync.py |
 | `local_notion_projects.json` | Snapshot of current Notion DB state |
 | `local_discord_channels.json` | Snapshot of current Discord channel state |
+| `local_discord_threads.json` | Snapshot of vermietungen threads after the last sync |
 | `all_eventworx_raw.json` | Raw API response dump (written every run) |
 
 ### Key data model details
@@ -80,6 +87,18 @@ For each project:
 ### Discord channel identification
 
 Relevant channels carry a `[EWX:P-XXXX]` tag in their topic — this is the join key between Discord and Eventworx. The sync script finds these channels via `_EWX_TAG_RE`, extracts the project number and any existing URL, then updates the tag to `[EWX:P-XXXX](eventworx-url)` when the URL is missing or stale. Discord supports `[text](url)` markdown in channel topics.
+
+### Vermietungen threads (Technikmiete jobs)
+
+`sync_vermietungen_threads()` manages one thread per active `Technikmiete` project inside the channel specified by `DISCORD_VERMIETUNGEN_CHANNEL_ID`.
+
+- **Target set**: projects with `status == "Aktiv"` AND `"Technikmiete" in categories`.
+- **Thread naming**: `P-XXXX_title`, truncated to 100 chars (`build_thread_name`). The `P-XXXX_` prefix is the join key — parsed via `_THREAD_PREFIX_RE`. Threads in this channel without that prefix are ignored.
+- **Reconciliation**:
+  - Target project with no active thread → unarchive a matching archived thread if one exists, otherwise create a new public thread (`type=11`, no starter message, 7-day auto-archive).
+  - Active thread whose project left the target set → PATCH `archived: true` (never deleted).
+  - Active thread still in target set whose name diverges from `build_thread_name(...)` → rename in place (e.g. when the Eventworx title changes).
+- Archived threads are only listed on demand (when at least one target project lacks an active thread), to avoid the extra paginated API call when not needed.
 
 ### Eventworx auth
 
