@@ -1,0 +1,26 @@
+[Unit]
+Description=ewxSync daemon (Eventworx -> Notion + Discord sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ewxsync
+WorkingDirectory=/opt/ewxsync
+ExecStart=/opt/ewxsync/.venv/bin/python -u /opt/ewxsync/ewxSync.py
+
+# Graceful shutdown: main() handles SIGTERM via _request_shutdown and exits
+# after the current tick. 30s is plenty for a full sync to finalize.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Restart on crashes / network blips, but not on a clean exit (systemctl stop).
+Restart=on-failure
+RestartSec=5
+
+# logs -> journald (view with: journalctl -u ewxsync -f)
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

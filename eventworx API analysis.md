@@ -51,7 +51,41 @@ These filters are what the Eventworx web UI sends when loading the "active order
 | `activeFrom\|*` | internal activation date | `activeFrom <= now` — excludes future-dated/not-yet-active docs; **not exposed in response body** |
 | `archived\|*` | `activation` field in response | `"false"` corresponds to `activation != "archived"` |
 
-The `|*` suffix is Eventworx's filter path wildcard notation.
+### Filter property syntax: `<field>|<case>`
+
+The suffix after `|` is **not** a wildcard — it is a *case* qualifier that lets a single request mix different filter sets per docType.
+
+- `|*` — the filter applies to every returned row.
+- `|case_<name>` — the filter belongs to a named case. All filters sharing the same case name are AND-ed together; different cases are OR-ed.
+
+Example from the "active offers + active orders" view (sorted by modification date):
+
+```json
+[
+  {"property": "subType|case_offer", "operator": "in", "value": ["offer"]},
+  {"property": "status|case_offer",  "operator": "in", "value": ["draft","open","sent"]},
+  {"property": "endDate|case_offer", "operator": ">",  "value": 1779467952241},
+  {"property": "subType|case_order", "operator": "in", "value": ["order"]},
+  {"property": "status|case_order",  "operator": "in", "value": ["draft","open","sent"]}
+]
+```
+
+This returns rows matching the offer AND-group **or** the order AND-group in a single response.
+
+### Querying by modification time
+
+The response body exposes the field as `modificationDate`, but Solr indexes it under the name **`lastModification`**. Use that name in `sort` and `filter`. Filtering on `modificationDate` directly fails with `undefined field: "modificationDate"`.
+
+Example — jobs modified in the last hour, newest first:
+
+```json
+{
+  "sort":   [{"property": "lastModification", "direction": "DESC"}],
+  "filter": [{"property": "lastModification|*", "operator": ">", "value": <now_ms - 3_600_000>}]
+}
+```
+
+Known operators across filter properties: `in`, `<`, `>`, `<=`, `>=`, `=`.
 
 ### Active status values by docType
 
