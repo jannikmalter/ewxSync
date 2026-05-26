@@ -8,9 +8,6 @@ from notion_client.errors import APIResponseError
 
 load_dotenv()
 
-force_notion_sync = False
-# When True, log every Discord write but make no API call (channel topics + thread sync).
-dry_run = False
 
 
 logging.basicConfig(level=logging.INFO,
@@ -37,9 +34,13 @@ DISCORD_CACHE    = "local_discord_channels.json"
 DISCORD_THREADS_CACHE = "local_discord_threads.json"
 
 # Daemon configuration
-POLL_INTERVAL_SECONDS = 60         # how often to probe Eventworx for changes
-FULL_SYNC_INTERVAL_SECONDS = 3600  # run an unconditional full sync at least this often
+POLL_INTERVAL_SECONDS = 60          # how often to probe Eventworx for changes
+FULL_SYNC_INTERVAL_SECONDS = 86400  # run an unconditional full sync at least this often (daily)
 SYNC_STATE_FILE = "sync_state.json"
+
+# Debug mode writes all local caches to disk for inspection. In normal operation
+# the daemon runs purely in memory — every restart triggers a full sync.
+DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
 
 # Thread names start with the project number so we can join threads to projects
 # without persisting any IDs: e.g. "P-1234_Sommerfest Müller".
@@ -129,6 +130,7 @@ class DiscordThread:
     threadName: str
     projectNumber: str
     archived: bool = False
+    crewPinged: bool = False  # set True once we've confirmed (or sent) a crew ping — skips API checks
 
 
 # --------------- HELPERS ---------------
@@ -423,8 +425,9 @@ def fetch_all_docs(session, token, category_map: dict) -> list[Document]:
         page += 1
         start += limit
 
-    with open("all_eventworx_raw.json", "w", encoding="utf-8") as f:
-        json.dump(all_raw, f, ensure_ascii=False, indent=2)
+    if DEBUG:
+        with open("all_eventworx_raw.json", "w", encoding="utf-8") as f:
+            json.dump(all_raw, f, ensure_ascii=False, indent=2)
 
     return docs
 
@@ -677,48 +680,15 @@ def build_notion_props(p: ProjectSummary) -> dict:
         props["Categories"] = {"multi_select": [{"name": c} for c in p.categories]}
     return props
 
-def load_local_projects() -> dict[str, ProjectSummary]:
-    """Load the aggregated ProjectSummary snapshot.
-
-    Used to bootstrap the in-memory project state at startup so an incremental
-    tick has a baseline to push from even before the next full sync. The raw
-    docs cache is the authoritative input to aggregation; this is the derived view.
-    """
-    if not os.path.exists(LOCAL_PROJECTS_CACHE):
-        return {}
-    with open(LOCAL_PROJECTS_CACHE, "r", encoding="utf-8") as f:
-        items = json.load(f)
-    projects = {}
-    for p in items:
-        if not isinstance(p.get("categories"), list):
-            p["categories"] = []
-        projects[p["projectNumber"]] = ProjectSummary(**p)
-    return projects
-
 def save_local_projects(projects: list[ProjectSummary]):
+    if not DEBUG:
+        return
     with open(LOCAL_PROJECTS_CACHE, "w", encoding="utf-8") as f:
         json.dump([asdict(p) for p in projects], f, ensure_ascii=False, indent=2)
 
-def load_local_docs() -> dict[str, dict[str, Document]]:
-    """Load raw EWX docs grouped by projectNumber, keyed by `(docType, docId)`.
-
-    This cache is the authoritative input to per-project re-aggregation on
-    incremental ticks. When the probe returns a changed doc, we replace the
-    matching entry in `docs[pn][key]` without re-fetching the rest of the project.
-    """
-    if not os.path.exists(LOCAL_DOCS_CACHE):
-        return {}
-    with open(LOCAL_DOCS_CACHE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    out: dict[str, dict[str, Document]] = {}
-    for pn, docs in raw.items():
-        out[pn] = {}
-        for d in docs:
-            doc = Document(**d)
-            out[pn][_doc_key(doc)] = doc
-    return out
-
 def save_local_docs(docs_by_pn: dict[str, dict[str, Document]]):
+    if not DEBUG:
+        return
     serializable = {pn: [asdict(d) for d in docs.values()]
                     for pn, docs in docs_by_pn.items()}
     with open(LOCAL_DOCS_CACHE, "w", encoding="utf-8") as f:
@@ -732,16 +702,9 @@ def _doc_key(d: Document) -> str:
     """
     return f"{d.docType}:{d.docId}"
 
-def load_sync_state() -> dict:
-    if not os.path.exists(SYNC_STATE_FILE):
-        return {}
-    try:
-        with open(SYNC_STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
 def save_sync_state(state: dict):
+    if not DEBUG:
+        return
     with open(SYNC_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -764,50 +727,14 @@ def meaningful_diffs(old_proj: ProjectSummary, new_proj: ProjectSummary) -> dict
     return diffs
 
 def save_notion_local_dict(existing: dict):
-    """Persist the Notion cache including page_id and last_edited_time.
-
-    Stored as a flat list (not a dict keyed by projectNumber) so the file remains
-    human-readable and easy to diff between runs.
-    """
+    """Persist the Notion cache including page_id and last_edited_time. Debug-only."""
+    if not DEBUG:
+        return
     serializable = [{"page_id": e["page_id"],
                      "last_edited_time": e.get("last_edited_time"),
                      "obj": asdict(e["obj"])} for e in existing.values()]
     with open("local_notion_projects.json", "w", encoding="utf-8") as f:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
-
-
-def load_notion_local() -> dict[str, dict]:
-    """Load the Notion cache. Empty when the file is missing or pre-refactor format.
-
-    Pre-refactor files contained only ProjectSummary records (no page_id), which
-    are unusable as a Notion mirror. We return empty for those — the next full
-    sync repopulates from Notion directly.
-    """
-    if not os.path.exists("local_notion_projects.json"):
-        return {}
-    try:
-        with open("local_notion_projects.json", "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(raw, list):
-        return {}
-    out: dict[str, dict] = {}
-    for item in raw:
-        if not isinstance(item, dict) or "page_id" not in item or "obj" not in item:
-            return {}  # legacy format, force a fresh fetch
-        obj = item["obj"]
-        if not isinstance(obj.get("categories"), list):
-            obj["categories"] = []
-        pn = obj.get("projectNumber")
-        if not pn:
-            continue
-        out[pn] = {
-            "page_id": item["page_id"],
-            "last_edited_time": item.get("last_edited_time"),
-            "obj": ProjectSummary(**obj),
-        }
-    return out
 
 
 # --------------- DISCORD ---------------
@@ -837,14 +764,10 @@ def fetch_discord_channels() -> list[DiscordChannel]:
     return channels
 
 def save_discord_local(channels: list[DiscordChannel]):
+    if not DEBUG:
+        return
     with open(DISCORD_CACHE, "w", encoding="utf-8") as f:
         json.dump([asdict(c) for c in channels], f, ensure_ascii=False, indent=2)
-
-def load_discord_local() -> list[DiscordChannel]:
-    if not os.path.exists(DISCORD_CACHE):
-        return []
-    with open(DISCORD_CACHE, "r", encoding="utf-8") as f:
-        return [DiscordChannel(**c) for c in json.load(f)]
 
 def build_discord_topic(old_topic: str | None, project_number: str,
                         ewx_url: str | None, notion_url: str | None) -> str:
@@ -955,6 +878,19 @@ def create_thread(channel_id: str, name: str) -> DiscordThread | None:
     r.raise_for_status()
     return _parse_thread(r.json())
 
+def thread_has_crew_ping(thread_id: str) -> bool:
+    """Return True if the Crew role has already been @-mentioned in this thread.
+    Checks the 50 oldest messages — our ping (when present) is always the starter."""
+    if not DISCORD_CREW_ROLE_ID:
+        return True  # nothing to ping; treat as already done
+    r = requests.get(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
+                     headers=_discord_headers(),
+                     params={"after": "0", "limit": 50})
+    r.raise_for_status()
+    needle = f"<@&{DISCORD_CREW_ROLE_ID}>"
+    return any(needle in (m.get("content") or "") for m in r.json())
+
+
 def ping_crew_in_thread(thread_id: str,
                         ewx_url: str | None = None,
                         notion_url: str | None = None):
@@ -999,6 +935,8 @@ def rename_thread(thread_id: str, name: str):
     r.raise_for_status()
 
 def save_discord_threads_local(threads: list[DiscordThread]):
+    if not DEBUG:
+        return
     with open(DISCORD_THREADS_CACHE, "w", encoding="utf-8") as f:
         json.dump([asdict(t) for t in threads], f, ensure_ascii=False, indent=2)
 
@@ -1046,7 +984,7 @@ def sync_job_channels(projects: list[ProjectSummary],
     subsequent per-project topic-update pass treats them as already-discovered.
     No archive/move when a project leaves the target set — channels are kept manually.
     """
-    prefix = "[DRY-RUN] " if dry_run else ""
+    prefix = "[DRY-RUN] " if DEBUG else ""
     logging.info("%sChecking job channels (Aktiv, non-Technikmiete)…", prefix)
 
     if not DISCORD_JOBS_CATEGORY_ID:
@@ -1073,7 +1011,7 @@ def sync_job_channels(projects: list[ProjectSummary],
         name = build_channel_name(p)
         ewx_tag = (f"[EWX:{p.projectNumber}]({p.representativeUrl})"
                    if p.representativeUrl else f"[EWX:{p.projectNumber}]")
-        if dry_run:
+        if DEBUG:
             logging.info("[DRY-RUN] Would create channel %s (%s) under category %s with topic %r",
                          p.projectNumber, name, DISCORD_JOBS_CATEGORY_ID, ewx_tag)
             continue
@@ -1083,7 +1021,7 @@ def sync_job_channels(projects: list[ProjectSummary],
             created.append(ch)
             logging.info("Created channel %s (%s)", p.projectNumber, name)
 
-    if dry_run:
+    if DEBUG:
         logging.info("[DRY-RUN] Job channels: would create %d.", len(missing))
     else:
         logging.info("Job channels: created %d.", len(created))
@@ -1097,7 +1035,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     - Active thread, project not in target set → archive.
     - Active thread in target set with stale name → rename.
     """
-    prefix = "[DRY-RUN] " if dry_run else ""
+    prefix = "[DRY-RUN] " if DEBUG else ""
     logging.info("%sChecking vermietungen threads (Aktiv + Technikmiete)…", prefix)
 
     if not DISCORD_VERMIETUNGEN_CHANNEL_ID:
@@ -1112,6 +1050,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     active = fetch_active_threads(channel_id)
     active_by_pn: dict[str, DiscordThread] = {}
     for t in active:
+        t.crewPinged = state.thread_crew_pinged.get(t.threadId, False)
         # Defensively keep the first thread we see for a given PN; log if duplicates exist.
         if t.projectNumber in active_by_pn:
             logging.warning("Duplicate active thread for %s: %s and %s",
@@ -1126,6 +1065,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
             archived = fetch_archived_threads(channel_id)
             archived_by_pn = {}
             for t in archived:
+                t.crewPinged = state.thread_crew_pinged.get(t.threadId, False)
                 # Keep the most recently archived (first in API response) per PN.
                 archived_by_pn.setdefault(t.projectNumber, t)
         return archived_by_pn
@@ -1150,7 +1090,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
         existing = active_by_pn.get(pn)
         if existing:
             if existing.threadName != desired_name:
-                if dry_run:
+                if DEBUG:
                     logging.info("[DRY-RUN] Would rename thread %s: %r → %r",
                                  pn, existing.threadName, desired_name)
                 else:
@@ -1163,7 +1103,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
         archived_match = archived_index().get(pn)
         if archived_match:
             name_arg = desired_name if archived_match.threadName != desired_name else None
-            if dry_run:
+            if DEBUG:
                 logging.info("[DRY-RUN] Would unarchive thread %s (%s)%s",
                              pn, archived_match.threadName,
                              f" and rename to {desired_name!r}" if name_arg else "")
@@ -1179,7 +1119,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
         notion_entry = state.notion_entries.get(pn)
         notion_url = notion_entry["obj"].notionUrl if notion_entry else None
         ewx_url = p.representativeUrl
-        if dry_run:
+        if DEBUG:
             logging.info("[DRY-RUN] Would create thread %s (%s)", pn, desired_name)
             logging.info("[DRY-RUN] Would ping crew in thread %s (EWX=%s, Notion=%s)",
                          pn, "yes" if ewx_url else "no", "yes" if notion_url else "no")
@@ -1189,12 +1129,14 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
                 final_state[pn] = created
                 logging.info("Created thread %s (%s)", pn, desired_name)
                 ping_crew_in_thread(created.threadId, ewx_url, notion_url)
+                created.crewPinged = True
+                state.thread_crew_pinged[created.threadId] = True
 
     # Pass 2: archive active threads whose project is no longer in the target set.
     for pn, t in active_by_pn.items():
         if pn in target:
             continue
-        if dry_run:
+        if DEBUG:
             logging.info("[DRY-RUN] Would archive thread %s (%s)", pn, t.threadName)
         else:
             archive_thread(t.threadId)
@@ -1202,7 +1144,35 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
             final_state[pn] = t
             logging.info("Archived thread %s (%s)", pn, t.threadName)
 
-    if dry_run:
+    # Pass 3: backfill the crew ping into target threads not yet confirmed.
+    # `crewPinged` is persisted in the local cache, so once a thread is True we never
+    # API-check it again. Only unknown (False) threads incur a GET /messages call.
+    if DISCORD_CREW_ROLE_ID:
+        backfilled = 0
+        for pn, p in target.items():
+            t = final_state.get(pn)
+            if t is None or t.crewPinged:
+                continue
+            if thread_has_crew_ping(t.threadId):
+                t.crewPinged = True  # already pinged by someone — record and skip
+                state.thread_crew_pinged[t.threadId] = True
+                continue
+            notion_entry = state.notion_entries.get(pn)
+            notion_url = notion_entry["obj"].notionUrl if notion_entry else None
+            ewx_url = p.representativeUrl
+            if DEBUG:
+                logging.info("[DRY-RUN] Would backfill crew ping in thread %s (%s)",
+                             pn, t.threadName)
+            else:
+                ping_crew_in_thread(t.threadId, ewx_url, notion_url)
+                t.crewPinged = True
+                state.thread_crew_pinged[t.threadId] = True
+                logging.info("Backfilled crew ping in thread %s (%s)", pn, t.threadName)
+                backfilled += 1
+        if backfilled:
+            logging.info("Threads: backfilled crew ping in %d thread(s).", backfilled)
+
+    if DEBUG:
         logging.info("[DRY-RUN] Skipping save of %s.", DISCORD_THREADS_CACHE)
     else:
         save_discord_threads_local(list(final_state.values()))
@@ -1213,8 +1183,10 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
 class SyncState:
     """In-memory mirror of EWX, Notion, and Discord state.
 
-    Mutated in place by full_sync / incremental_sync. Persisted to disk after
-    every successful tick so a daemon restart can resume without a full fetch.
+    Mutated in place by full_sync / incremental_sync. Lives entirely in memory:
+    a daemon restart always begins with an empty state and triggers a full sync.
+    When DEBUG is set, snapshots are written to disk after each tick for inspection,
+    but never read back.
     """
     docs_by_pn: dict[str, dict[str, Document]]       # raw EWX docs (authoritative input)
     projects: dict[str, ProjectSummary]              # derived view of docs_by_pn
@@ -1222,28 +1194,19 @@ class SyncState:
     discord_by_pn: dict[str, DiscordChannel]         # mirror of Discord channels with EWX tags
     data_source_id: str                              # cached Notion data source id
     category_map: dict[str, str]                     # EWX category id → name, refreshed on full sync
+    thread_crew_pinged: dict[str, bool]              # {threadId: True} once a Crew ping is confirmed or sent
 
 
-def load_sync_state_from_disk(data_source_id: str) -> SyncState:
-    """Reconstruct in-memory state from the persisted caches.
-
-    Anything missing reverts to empty — a full sync on the first tick repopulates
-    everything. The aggregated-projects cache is rebuilt from raw docs at load time
-    so the two views can't diverge across restarts.
-    """
-    docs_by_pn = load_local_docs()
-    notion_entries = load_notion_local()
-    discord_by_pn = {ch.projectNumber: ch for ch in load_discord_local()}
-    now_ms = int(time.time() * 1000)
-    projects = {pn: aggregate_one_project(pn, list(docs.values()), now_ms)
-                for pn, docs in docs_by_pn.items()}
+def new_empty_state(data_source_id: str) -> SyncState:
+    """Build a fresh empty SyncState. The first tick will populate it via a full sync."""
     return SyncState(
-        docs_by_pn=docs_by_pn,
-        projects=projects,
-        notion_entries=notion_entries,
-        discord_by_pn=discord_by_pn,
+        docs_by_pn={},
+        projects={},
+        notion_entries={},
+        discord_by_pn={},
         data_source_id=data_source_id,
         category_map={},
+        thread_crew_pinged={},
     )
 
 
@@ -1255,10 +1218,12 @@ def save_state_to_disk(state: SyncState):
 
 
 def push_project_to_notion(p: ProjectSummary, state: SyncState) -> bool:
-    """Push a project to Notion if it diverges from the cache.
+    """Push a project to Notion if it diverges from the in-memory mirror.
 
-    Returns True when an API write happened. Cache is refreshed from the
-    response on every write so it stays a perfect mirror of Notion.
+    Returns True when a write happened (or would have, under DEBUG). The mirror
+    is refreshed from the API response on every real write so it stays perfectly
+    aligned with Notion. Under DEBUG no API call is made and the mirror is left
+    alone — the same would-write log line will repeat on subsequent ticks.
     """
     props = build_notion_props(p)
     entry = state.notion_entries.get(p.projectNumber)
@@ -1266,14 +1231,18 @@ def push_project_to_notion(p: ProjectSummary, state: SyncState) -> bool:
         mdiffs = meaningful_diffs(entry["obj"], p)
         # Set icon only if none is set yet — don't overwrite manually chosen icons.
         desired_icon = page_icon(p) if entry["obj"].icon is None else None
-        if not (force_notion_sync or mdiffs or desired_icon):
+        if not (mdiffs or desired_icon):
             return False
+        change_label = ", ".join(sorted(mdiffs.keys())) or "icon"
+        if DEBUG:
+            logging.info("[DRY-RUN] Would update Notion %s (%s) — %s",
+                         p.projectNumber, p.representativeJob, change_label)
+            return True
         updated = notion_call(notion.pages.update, page_id=entry["page_id"],
                               properties=props,
                               **({"icon": desired_icon} if desired_icon else {}))
         logging.info("Updated  Notion  %s (%s) — %s",
-                     p.projectNumber, p.representativeJob,
-                     ", ".join(sorted(mdiffs.keys())) or "icon")
+                     p.projectNumber, p.representativeJob, change_label)
         if isinstance(updated, dict):
             extracted = extract_notion_entry(updated)
             if extracted is not None:
@@ -1282,6 +1251,10 @@ def push_project_to_notion(p: ProjectSummary, state: SyncState) -> bool:
         return True
     # New page.
     icon = page_icon(p)
+    if DEBUG:
+        logging.info("[DRY-RUN] Would create Notion %s (%s)",
+                     p.projectNumber, p.representativeJob)
+        return True
     created = notion_call(notion.pages.create,
                           parent={"data_source_id": state.data_source_id},
                           properties=props,
@@ -1313,9 +1286,9 @@ def push_project_to_discord_topic(p: ProjectSummary, state: SyncState) -> tuple[
     new_ewx_url = p.representativeUrl or ch.eventworxUrl
     new_notion_url = notion_url or ch.notionUrl
     new_topic = build_discord_topic(ch.topic, p.projectNumber, new_ewx_url, new_notion_url)
-    prefix_ = "[DRY-RUN] " if dry_run else ""
-    verb = "Would update" if dry_run else "Updated "
-    if not dry_run:
+    prefix_ = "[DRY-RUN] " if DEBUG else ""
+    verb = "Would update" if DEBUG else "Updated "
+    if not DEBUG:
         update_discord_topic(ch.channelId, new_topic)
         ch.topic = new_topic
         ch.eventworxUrl = new_ewx_url
@@ -1346,10 +1319,11 @@ def push_projects(pns: list[str], state: SyncState):
             discord_pushed += 1
         else:
             discord_unchanged += 1
-    logging.info("Notion: %d pushed, %d unchanged.", notion_pushed, notion_unchanged)
+    verb = "would-push" if DEBUG else "pushed"
+    logging.info("Notion: %d %s, %d unchanged.", notion_pushed, verb, notion_unchanged)
     logging.info("Discord topics: %d %s, %d unchanged, %d skipped (no channel).",
                  discord_pushed,
-                 "would-update" if dry_run else "updated",
+                 "would-update" if DEBUG else "updated",
                  discord_unchanged, discord_skipped)
 
 
@@ -1494,22 +1468,18 @@ def main():
     signal.signal(signal.SIGINT,  _request_shutdown)
     signal.signal(signal.SIGTERM, _request_shutdown)
 
-    persisted = load_sync_state()
-    last_ewx_check_ms:    int | None = persisted.get("last_ewx_check_ms")
-    last_notion_check_iso: str | None = persisted.get("last_notion_check_iso")
-    last_full_sync_at:    int | None = persisted.get("last_full_sync_at_ms")
+    # Memory-only operation: no checkpoints are loaded from disk. Every daemon
+    # restart begins with an empty SyncState and the first tick is always a full sync.
+    last_ewx_check_ms:    int | None = None
+    last_notion_check_iso: str | None = None
+    last_full_sync_at:    int | None = None
 
     # Resolve the Notion data source id once at startup — it doesn't change at runtime.
     data_source_id = resolve_notion_data_source_id()
-    state = load_sync_state_from_disk(data_source_id)
+    state = new_empty_state(data_source_id)
 
-    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds. "
-                 "last_full_sync_at=%s, last_ewx_check=%s, last_notion_check=%s. "
-                 "Cache: %d project(s), %d Notion entry/ies, %d Discord channel(s).",
-                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS,
-                 _fmt_ts(last_full_sync_at), _fmt_ts(last_ewx_check_ms),
-                 last_notion_check_iso or "never",
-                 len(state.projects), len(state.notion_entries), len(state.discord_by_pn))
+    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds, debug=%s.",
+                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS, DEBUG)
 
     session = auth_token = None
     first_tick = True
@@ -1536,7 +1506,7 @@ def main():
                     elif first_tick:
                         reason = "startup full sync"
                     else:
-                        reason = "hourly full sync"
+                        reason = "scheduled full sync"
                     logging.info("Tick: %s.", reason)
                     new_ewx_check = full_sync(session, auth_token, state)
                     last_full_sync_at  = tick_ms
