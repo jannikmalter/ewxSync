@@ -31,6 +31,7 @@ DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 DISCORD_VERMIETUNGEN_CHANNEL_ID = os.getenv("DISCORD_VERMIETUNGEN_CHANNEL_ID")
 DISCORD_JOBS_CATEGORY_ID = os.getenv("DISCORD_JOBS_CATEGORY_ID")
+DISCORD_CREW_ROLE_ID = os.getenv("DISCORD_CREW_ROLE_ID")
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_CACHE    = "local_discord_channels.json"
 DISCORD_THREADS_CACHE = "local_discord_threads.json"
@@ -954,6 +955,19 @@ def create_thread(channel_id: str, name: str) -> DiscordThread | None:
     r.raise_for_status()
     return _parse_thread(r.json())
 
+def ping_crew_in_thread(thread_id: str):
+    """Post a role mention so all Crew members get auto-added to the thread."""
+    if not DISCORD_CREW_ROLE_ID:
+        logging.warning("DISCORD_CREW_ROLE_ID not set — skipping crew ping.")
+        return
+    payload = {
+        "content": f"<@&{DISCORD_CREW_ROLE_ID}>",
+        "allowed_mentions": {"parse": [], "roles": [DISCORD_CREW_ROLE_ID]},
+    }
+    r = requests.post(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
+                      headers=_discord_headers(), json=payload)
+    r.raise_for_status()
+
 def archive_thread(thread_id: str):
     r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
                        headers=_discord_headers(), json={"archived": True})
@@ -1153,11 +1167,13 @@ def sync_vermietungen_threads(projects: list[ProjectSummary]):
 
         if dry_run:
             logging.info("[DRY-RUN] Would create thread %s (%s)", pn, desired_name)
+            logging.info("[DRY-RUN] Would ping crew in thread %s", pn)
         else:
             created = create_thread(channel_id, desired_name)
             if created:
                 final_state[pn] = created
                 logging.info("Created thread %s (%s)", pn, desired_name)
+                ping_crew_in_thread(created.threadId)
 
     # Pass 2: archive active threads whose project is no longer in the target set.
     for pn, t in active_by_pn.items():
