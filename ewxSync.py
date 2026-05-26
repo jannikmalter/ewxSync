@@ -955,13 +955,24 @@ def create_thread(channel_id: str, name: str) -> DiscordThread | None:
     r.raise_for_status()
     return _parse_thread(r.json())
 
-def ping_crew_in_thread(thread_id: str):
-    """Post a role mention so all Crew members get auto-added to the thread."""
+def ping_crew_in_thread(thread_id: str,
+                        ewx_url: str | None = None,
+                        notion_url: str | None = None):
+    """Post a role mention so all Crew members get auto-added to the thread.
+    Includes Eventworx and Notion links when available."""
     if not DISCORD_CREW_ROLE_ID:
         logging.warning("DISCORD_CREW_ROLE_ID not set — skipping crew ping.")
         return
+    parts = [f"<@&{DISCORD_CREW_ROLE_ID}>"]
+    links = []
+    if ewx_url:
+        links.append(f"[Eventworx](<{ewx_url}>)")
+    if notion_url:
+        links.append(f"[Notion](<{notion_url}>)")
+    if links:
+        parts.append(" · ".join(links))
     payload = {
-        "content": f"<@&{DISCORD_CREW_ROLE_ID}>",
+        "content": "\n".join(parts),
         "allowed_mentions": {"parse": [], "roles": [DISCORD_CREW_ROLE_ID]},
     }
     r = requests.post(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
@@ -1079,7 +1090,7 @@ def sync_job_channels(projects: list[ProjectSummary],
     return created
 
 
-def sync_vermietungen_threads(projects: list[ProjectSummary]):
+def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"):
     """Reconcile threads in the vermietungen channel against Aktiv+Technikmiete projects.
 
     - Project in target set, no active thread → unarchive an existing one if found, else create.
@@ -1165,15 +1176,19 @@ def sync_vermietungen_threads(projects: list[ProjectSummary]):
                 logging.info("Unarchived thread %s (%s)", pn, archived_match.threadName)
             continue
 
+        notion_entry = state.notion_entries.get(pn)
+        notion_url = notion_entry["obj"].notionUrl if notion_entry else None
+        ewx_url = p.representativeUrl
         if dry_run:
             logging.info("[DRY-RUN] Would create thread %s (%s)", pn, desired_name)
-            logging.info("[DRY-RUN] Would ping crew in thread %s", pn)
+            logging.info("[DRY-RUN] Would ping crew in thread %s (EWX=%s, Notion=%s)",
+                         pn, "yes" if ewx_url else "no", "yes" if notion_url else "no")
         else:
             created = create_thread(channel_id, desired_name)
             if created:
                 final_state[pn] = created
                 logging.info("Created thread %s (%s)", pn, desired_name)
-                ping_crew_in_thread(created.threadId)
+                ping_crew_in_thread(created.threadId, ewx_url, notion_url)
 
     # Pass 2: archive active threads whose project is no longer in the target set.
     for pn, t in active_by_pn.items():
@@ -1406,7 +1421,7 @@ def full_sync(session, token, state: SyncState) -> int:
 
     push_projects(sorted(state.projects.keys()), state)
 
-    sync_vermietungen_threads(list(state.projects.values()))
+    sync_vermietungen_threads(list(state.projects.values()), state)
 
     save_state_to_disk(state)
     return now_ms
@@ -1446,7 +1461,7 @@ def incremental_sync(session, token, state: SyncState,
     # Job channels & vermietungen threads need the full project list; only run when
     # at least one project changed (cheap relative to a tick that pushed real diffs).
     sync_job_channels(list(state.projects.values()), state.discord_by_pn)
-    sync_vermietungen_threads(list(state.projects.values()))
+    sync_vermietungen_threads(list(state.projects.values()), state)
 
     save_state_to_disk(state)
     return tick_ms, tick_iso
