@@ -50,7 +50,7 @@ CHANNEL_NAME_MAX = 100  # Discord channel name limit
 
 _EWX_TAG_RE = re.compile(r'\[EWX:(P-\d+)\](?:\(([^)]+)\))?')
 _NOTION_TAG_RE = re.compile(r'\[Notion\]\(([^)]+)\)')
-_THREAD_PREFIX_RE = re.compile(r'^(P-\d+)(?:_| \| )')
+_THREAD_PREFIX_RE = re.compile(r'^(P-\d+)_')
 
 COMMON_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
@@ -859,15 +859,9 @@ def fetch_archived_threads(channel_id: str) -> list[DiscordThread]:
         before = last
     return threads
 
-def build_thread_name(p: ProjectSummary) -> str:
-    title = (p.title or "").strip() or "Untitled"
-    date_part = ""
-    if p.rentStartDate:
-        try:
-            date_part = datetime.fromisoformat(p.rentStartDate).strftime("%d.%m.") + " "
-        except (ValueError, TypeError):
-            date_part = ""
-    name = f"{p.projectNumber} | {date_part}{title}"
+def build_thread_name(project_number: str, title: str) -> str:
+    title = (title or "").strip() or "Untitled"
+    name = f"{project_number}_{title}"
     if len(name) > THREAD_NAME_MAX:
         name = name[:THREAD_NAME_MAX]
     return name
@@ -1081,7 +1075,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     # Plan summary (computed before mutations so dry-run shows the same totals as a real run).
     plan_rename = sum(1 for pn, p in target.items()
                       if pn in active_by_pn
-                      and active_by_pn[pn].threadName != build_thread_name(p))
+                      and active_by_pn[pn].threadName != build_thread_name(pn, p.title))
     plan_missing = [pn for pn in target if pn not in active_by_pn]
     plan_archive = sum(1 for pn in active_by_pn if pn not in target)
     if not (plan_missing or plan_rename or plan_archive):
@@ -1092,7 +1086,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
 
     # Pass 1: ensure each target project has an active thread with the right name.
     for pn, p in target.items():
-        desired_name = build_thread_name(p)
+        desired_name = build_thread_name(pn, p.title)
         existing = active_by_pn.get(pn)
         if existing:
             if existing.threadName != desired_name:

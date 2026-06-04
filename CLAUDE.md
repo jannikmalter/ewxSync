@@ -221,7 +221,7 @@ Relevant channels carry an `[EWX:P-XXXX]` tag in their topic — this is the joi
 `sync_vermietungen_threads()` manages one thread per active `Technikmiete` project inside the channel specified by `DISCORD_VERMIETUNGEN_CHANNEL_ID`.
 
 - **Target set**: projects with `status == "Aktiv"` AND `"Technikmiete" in categories`.
-- **Thread naming**: `P-XXXX | DD.MM. title` (e.g. `P-1234 | 05.12. Sommerfest Müller`), truncated to 100 chars (`build_thread_name`). The `DD.MM.` part comes from the project's `rentStartDate` and is omitted when unset. The `P-XXXX` prefix is the join key — parsed via `_THREAD_PREFIX_RE`, which also accepts the legacy `P-XXXX_title` format so pre-existing threads get renamed in place instead of duplicated. Threads in this channel without either prefix shape are ignored.
+- **Thread naming**: `P-XXXX_title`, truncated to 100 chars (`build_thread_name`). The `P-XXXX_` prefix is the join key — parsed via `_THREAD_PREFIX_RE`. Threads in this channel without that prefix are ignored.
 - **Reconciliation**:
   - Target project with no active thread → unarchive a matching archived thread if one exists, otherwise create a new public thread (`type=11`, no starter message, 7-day auto-archive).
   - Active thread whose project left the target set → PATCH `archived: true` (never deleted).
