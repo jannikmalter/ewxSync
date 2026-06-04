@@ -42,6 +42,10 @@ SYNC_STATE_FILE = "sync_state.json"
 # the daemon runs purely in memory — every restart triggers a full sync.
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
 
+# Kill-switch for the Discord "has been created" announcements. When off, no
+# per-document messages are posted and new threads fall back to a plain crew ping.
+ANNOUNCE_NEW_DOCS = os.getenv("ANNOUNCE_NEW_DOCS", "true").lower() in ("1", "true", "yes", "on")
+
 # Thread names start with the project number so we can join threads to projects
 # without persisting any IDs: e.g. "P-1234_Sommerfest Müller".
 THREAD_NAME_MAX = 100  # Discord channel/thread name limit
@@ -50,7 +54,7 @@ CHANNEL_NAME_MAX = 100  # Discord channel name limit
 
 _EWX_TAG_RE = re.compile(r'\[EWX:(P-\d+)\](?:\(([^)]+)\))?')
 _NOTION_TAG_RE = re.compile(r'\[Notion\]\(([^)]+)\)')
-_THREAD_PREFIX_RE = re.compile(r'^(P-\d+)_')
+_THREAD_PREFIX_RE = re.compile(r'^(P-\d+)(?:_| \| )')
 
 COMMON_HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
@@ -68,7 +72,18 @@ CANCELLED_STATUSES    = {"rejected", "cancelled"}
 
 # Priority for picking the representative doc on closed projects.
 # Invoice is the final stage of the lifecycle and carries the most complete information.
-CLOSED_REP_PRIORITY = {"invoice": 4, "deliverynote": 3, "order": 2, "offer": 1}
+# Delivery notes rank below order/offer — they can deviate from the agreed contract,
+# so they only represent a project when nothing more authoritative exists.
+CLOSED_REP_PRIORITY = {"invoice": 4, "order": 3, "offer": 2, "deliverynote": 1}
+
+# Human-readable noun per EWX docType, used in the Discord "has been created" messages.
+EWX_DOC_TYPE_LABELS = {
+    "order": "Order",
+    "offer": "Offer",
+    "request": "Request",
+    "deliverynote": "Deliverynote",
+    "invoice": "Invoice",
+}
 
 
 # --------------- DATA MODELS ---------------
@@ -182,6 +197,23 @@ def make_project_summary(projectNumber, title, status, currentPrice, rentStartDa
         notionUrl=notionUrl or None,
     )
 
+def eventworx_doc_url(doc_type: str, doc_id: str) -> str | None:
+    """Deep-link to a document in the Eventworx UI, or None when no docId is known."""
+    if not doc_id:
+        return None
+    return f"{EVENTWORX_BASE}/eventworx/#job/edit/{doc_type}/{doc_id}"
+
+def format_doc_created_line(d: Document) -> str:
+    """One-line Discord announcement for a newly created document.
+
+    e.g. "Order [AU-1234](<url>) has been created!". The URL is angle-bracketed
+    to suppress Discord's link embed, matching the crew-ping style.
+    """
+    label = EWX_DOC_TYPE_LABELS.get(d.docType, d.docType.capitalize() or "Document")
+    url = eventworx_doc_url(d.docType, d.docId)
+    link = f"[{d.jobNumber}](<{url}>)" if url else d.jobNumber
+    return f"{label} {link} has been created!"
+
 def _first_non_null(docs: list[Document], attr: str):
     """Return the first non-null value for attr, preferring the most recently modified doc."""
     for d in sorted(docs, key=lambda d: d.modificationDate or 0, reverse=True):
@@ -237,7 +269,7 @@ def classify_project(docs: list[Document], now_ms: int) -> tuple[str, Document]:
         return "Aktiv", max(live_offers, key=lambda d: d.modificationDate or 0)
 
     # No active document — project is closed.
-    # Rep is the highest-priority doc type (invoice > deliverynote > order > offer),
+    # Rep is the highest-priority doc type (invoice > order > offer > deliverynote),
     # with modificationDate as tiebreaker. Status is read from the most recent doc.
     rep = max(docs, key=lambda d: (CLOSED_REP_PRIORITY.get(d.docType, 0), d.modificationDate or 0))
     by_recency = sorted(docs, key=lambda d: d.modificationDate or 0, reverse=True)
@@ -280,8 +312,7 @@ def aggregate_one_project(pn: str, docs: list[Document], now_ms: int | None = No
     rent_start = rep.rentStartDate or _first_non_null(docs, "rentStartDate")
     rent_end   = rep.rentEndDate   or _first_non_null(docs, "rentEndDate")
 
-    rep_url = (f"{EVENTWORX_BASE}/eventworx/#job/edit/{rep.docType}/{rep.docId}"
-               if rep.docId else None)
+    rep_url = eventworx_doc_url(rep.docType, rep.docId)
 
     return ProjectSummary(
         projectNumber=pn,
@@ -859,9 +890,15 @@ def fetch_archived_threads(channel_id: str) -> list[DiscordThread]:
         before = last
     return threads
 
-def build_thread_name(project_number: str, title: str) -> str:
-    title = (title or "").strip() or "Untitled"
-    name = f"{project_number}_{title}"
+def build_thread_name(p: ProjectSummary) -> str:
+    title = (p.title or "").strip() or "Untitled"
+    date_part = ""
+    if p.rentStartDate:
+        try:
+            date_part = datetime.fromisoformat(p.rentStartDate).strftime("%d.%m.") + " "
+        except (ValueError, TypeError):
+            date_part = ""
+    name = f"{p.projectNumber} | {date_part}{title}"
     if len(name) > THREAD_NAME_MAX:
         name = name[:THREAD_NAME_MAX]
     return name
@@ -891,29 +928,44 @@ def thread_has_crew_ping(thread_id: str) -> bool:
     return any(needle in (m.get("content") or "") for m in r.json())
 
 
+def post_discord_message(channel_id: str, content: str,
+                         allowed_mentions: dict | None = None):
+    """Post a plain message to a channel or thread (same endpoint for both)."""
+    payload: dict = {"content": content}
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
+    r = requests.post(f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+                      headers=_discord_headers(), json=payload)
+    r.raise_for_status()
+
+
 def ping_crew_in_thread(thread_id: str,
                         ewx_url: str | None = None,
-                        notion_url: str | None = None):
-    """Post a role mention so all Crew members get auto-added to the thread.
-    Includes Eventworx and Notion links when available."""
-    if not DISCORD_CREW_ROLE_ID:
-        logging.warning("DISCORD_CREW_ROLE_ID not set — skipping crew ping.")
-        return
-    parts = [f"<@&{DISCORD_CREW_ROLE_ID}>"]
+                        notion_url: str | None = None,
+                        header_lines: list[str] | None = None):
+    """Post the thread's intro message: optional announcement lines on top, then a
+    Crew role mention (auto-subscribing its members) with Eventworx/Notion links.
+
+    The role mention is included only when DISCORD_CREW_ROLE_ID is set, but the
+    message still posts when `header_lines` carry content — so a brand-new thread's
+    "has been created" announcement is delivered even without a crew role.
+    """
+    lines = list(header_lines or [])
+    if DISCORD_CREW_ROLE_ID:
+        lines.append(f"<@&{DISCORD_CREW_ROLE_ID}>")
     links = []
     if ewx_url:
         links.append(f"[Eventworx](<{ewx_url}>)")
     if notion_url:
         links.append(f"[Notion](<{notion_url}>)")
     if links:
-        parts.append(" · ".join(links))
-    payload = {
-        "content": "\n".join(parts),
-        "allowed_mentions": {"parse": [], "roles": [DISCORD_CREW_ROLE_ID]},
-    }
-    r = requests.post(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
-                      headers=_discord_headers(), json=payload)
-    r.raise_for_status()
+        lines.append(" · ".join(links))
+    if not lines:
+        logging.warning("Nothing to post in thread %s (no crew role, no announcement).",
+                        thread_id)
+        return
+    allowed = {"parse": [], "roles": [DISCORD_CREW_ROLE_ID] if DISCORD_CREW_ROLE_ID else []}
+    post_discord_message(thread_id, "\n".join(lines), allowed)
 
 def archive_thread(thread_id: str):
     r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
@@ -1014,6 +1066,16 @@ def sync_job_channels(projects: list[ProjectSummary],
         if DEBUG:
             logging.info("[DRY-RUN] Would create channel %s (%s) under category %s with topic %r",
                          p.projectNumber, name, DISCORD_JOBS_CATEGORY_ID, ewx_tag)
+            # Insert a synthetic channel so downstream dry-run passes (topic update,
+            # announce_new_docs) route exactly like a real run. The fake channelId is
+            # never used for an API call — every external write is gated behind DEBUG.
+            discord_by_project[p.projectNumber] = DiscordChannel(
+                channelId=f"dry-run:{p.projectNumber}",
+                channelName=name,
+                projectNumber=p.projectNumber,
+                eventworxUrl=p.representativeUrl,
+                topic=ewx_tag,
+            )
             continue
         ch = create_discord_channel(name, ewx_tag, DISCORD_JOBS_CATEGORY_ID)
         if ch:
@@ -1028,19 +1090,27 @@ def sync_job_channels(projects: list[ProjectSummary],
     return created
 
 
-def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"):
+def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState",
+                              new_docs_by_pn: dict[str, list[Document]] | None = None) -> set[str]:
     """Reconcile threads in the vermietungen channel against Aktiv+Technikmiete projects.
 
     - Project in target set, no active thread → unarchive an existing one if found, else create.
     - Active thread, project not in target set → archive.
     - Active thread in target set with stale name → rename.
+
+    When a thread is newly created and `new_docs_by_pn` carries that project's new docs,
+    their "has been created" lines are folded into the thread's combined intro message
+    (above the crew ping). Returns the set of projectNumbers announced this way so the
+    caller's announce pass skips them. Also refreshes `state.discord_threads_by_pn`.
     """
+    new_docs_by_pn = new_docs_by_pn or {}
+    announced: set[str] = set()
     prefix = "[DRY-RUN] " if DEBUG else ""
     logging.info("%sChecking vermietungen threads (Aktiv + Technikmiete)…", prefix)
 
     if not DISCORD_VERMIETUNGEN_CHANNEL_ID:
         logging.warning("DISCORD_VERMIETUNGEN_CHANNEL_ID not set — skipping thread sync.")
-        return
+        return announced
 
     channel_id = DISCORD_VERMIETUNGEN_CHANNEL_ID
     target = {p.projectNumber: p for p in projects
@@ -1075,7 +1145,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     # Plan summary (computed before mutations so dry-run shows the same totals as a real run).
     plan_rename = sum(1 for pn, p in target.items()
                       if pn in active_by_pn
-                      and active_by_pn[pn].threadName != build_thread_name(pn, p.title))
+                      and active_by_pn[pn].threadName != build_thread_name(p))
     plan_missing = [pn for pn in target if pn not in active_by_pn]
     plan_archive = sum(1 for pn in active_by_pn if pn not in target)
     if not (plan_missing or plan_rename or plan_archive):
@@ -1086,7 +1156,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
 
     # Pass 1: ensure each target project has an active thread with the right name.
     for pn, p in target.items():
-        desired_name = build_thread_name(pn, p.title)
+        desired_name = build_thread_name(p)
         existing = active_by_pn.get(pn)
         if existing:
             if existing.threadName != desired_name:
@@ -1119,16 +1189,22 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
         notion_entry = state.notion_entries.get(pn)
         notion_url = notion_entry["obj"].notionUrl if notion_entry else None
         ewx_url = p.representativeUrl
+        # New docs for this project are announced in the thread's first (intro) message,
+        # combined with the crew ping — so the announcement is genuinely first.
+        header_lines = [format_doc_created_line(d) for d in new_docs_by_pn.get(pn, [])]
+        if header_lines:
+            announced.add(pn)
         if DEBUG:
             logging.info("[DRY-RUN] Would create thread %s (%s)", pn, desired_name)
-            logging.info("[DRY-RUN] Would ping crew in thread %s (EWX=%s, Notion=%s)",
-                         pn, "yes" if ewx_url else "no", "yes" if notion_url else "no")
+            logging.info("[DRY-RUN] Would ping crew in thread %s (EWX=%s, Notion=%s)%s",
+                         pn, "yes" if ewx_url else "no", "yes" if notion_url else "no",
+                         f" + announce {len(header_lines)} new doc(s)" if header_lines else "")
         else:
             created = create_thread(channel_id, desired_name)
             if created:
                 final_state[pn] = created
                 logging.info("Created thread %s (%s)", pn, desired_name)
-                ping_crew_in_thread(created.threadId, ewx_url, notion_url)
+                ping_crew_in_thread(created.threadId, ewx_url, notion_url, header_lines)
                 created.crewPinged = True
                 state.thread_crew_pinged[created.threadId] = True
 
@@ -1172,10 +1248,14 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
         if backfilled:
             logging.info("Threads: backfilled crew ping in %d thread(s).", backfilled)
 
+    state.discord_threads_by_pn = final_state
+
     if DEBUG:
         logging.info("[DRY-RUN] Skipping save of %s.", DISCORD_THREADS_CACHE)
     else:
         save_discord_threads_local(list(final_state.values()))
+
+    return announced
 
 
 # ---------------- SYNC PIPELINE ----------------
@@ -1192,6 +1272,7 @@ class SyncState:
     projects: dict[str, ProjectSummary]              # derived view of docs_by_pn
     notion_entries: dict[str, dict]                  # mirror of Notion {pn: {"page_id", "last_edited_time", "obj"}}
     discord_by_pn: dict[str, DiscordChannel]         # mirror of Discord channels with EWX tags
+    discord_threads_by_pn: dict[str, DiscordThread]  # vermietungen threads by pn, refreshed each thread sync
     data_source_id: str                              # cached Notion data source id
     category_map: dict[str, str]                     # EWX category id → name, refreshed on full sync
     thread_crew_pinged: dict[str, bool]              # {threadId: True} once a Crew ping is confirmed or sent
@@ -1204,6 +1285,7 @@ def new_empty_state(data_source_id: str) -> SyncState:
         projects={},
         notion_entries={},
         discord_by_pn={},
+        discord_threads_by_pn={},
         data_source_id=data_source_id,
         category_map={},
         thread_crew_pinged={},
@@ -1327,25 +1409,78 @@ def push_projects(pns: list[str], state: SyncState):
                  discord_unchanged, discord_skipped)
 
 
-def apply_changed_docs(state: SyncState, changed: list[Document]) -> set[str]:
+def apply_changed_docs(state: SyncState, changed: list[Document]) -> tuple[set[str], list[Document]]:
     """Merge changed docs into state.docs_by_pn and re-aggregate affected projects.
 
-    Returns the set of affected projectNumbers so the caller can push them.
-    A doc whose projectNumber is empty is skipped — Eventworx returns such rows
-    for unassigned drafts and they don't belong to any aggregate.
+    Returns `(affected, new_docs)`: the set of affected projectNumbers so the caller
+    can push them, and the docs that did not previously exist in the in-memory mirror
+    (a docId we hadn't seen) so the caller can announce them. A doc whose projectNumber
+    is empty is skipped — Eventworx returns such rows for unassigned drafts and they
+    don't belong to any aggregate.
     """
     affected: set[str] = set()
+    new_docs: list[Document] = []
     for d in changed:
         if not d.projectNumber:
             continue
         bucket = state.docs_by_pn.setdefault(d.projectNumber, {})
-        bucket[_doc_key(d)] = d
+        key = _doc_key(d)
+        if key not in bucket:
+            new_docs.append(d)
+        bucket[key] = d
         affected.add(d.projectNumber)
     now_ms = int(time.time() * 1000)
     for pn in affected:
         docs = list(state.docs_by_pn[pn].values())
         state.projects[pn] = aggregate_one_project(pn, docs, now_ms)
-    return affected
+    return affected, new_docs
+
+
+def discord_destination(pn: str, p: ProjectSummary, state: SyncState) -> str | None:
+    """Resolve the channel/thread id a project's messages should go to, or None.
+
+    Technikmiete projects live in a vermietungen thread; everything else in a job
+    channel. Returns None when no destination exists yet (e.g. a project that never
+    became Aktiv, so no channel/thread was created).
+    """
+    if "Technikmiete" in (p.categories or []):
+        t = state.discord_threads_by_pn.get(pn)
+        return t.threadId if t and not t.archived else None
+    ch = state.discord_by_pn.get(pn)
+    return ch.channelId if ch else None
+
+
+def announce_new_docs(new_docs: list[Document], state: SyncState, announced_pns: set[str]):
+    """Post a "<Type> <job> has been created!" message per newly created document.
+
+    `announced_pns` are projects whose new docs were already folded into a freshly
+    created thread's combined intro message — skip them to avoid a duplicate. Docs
+    whose project has no Discord destination yet are silently skipped.
+    """
+    sent = skipped = 0
+    for d in new_docs:
+        pn = d.projectNumber
+        if pn in announced_pns:
+            continue
+        p = state.projects.get(pn)
+        if p is None:
+            skipped += 1
+            continue
+        dest = discord_destination(pn, p, state)
+        if not dest:
+            skipped += 1
+            continue
+        line = format_doc_created_line(d)
+        if DEBUG:
+            logging.info("[DRY-RUN] Would announce in %s: %s", pn, line)
+            sent += 1
+            continue
+        post_discord_message(dest, line)
+        logging.info("Announced in %s: %s", pn, line)
+        sent += 1
+    if new_docs:
+        logging.info("Announcements: %d %s, %d skipped (no destination).",
+                     sent, "would-send" if DEBUG else "sent", skipped)
 
 
 def apply_changed_notion(state: SyncState, changed: list[tuple[str, dict]]) -> set[str]:
@@ -1416,9 +1551,16 @@ def incremental_sync(session, token, state: SyncState,
     tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()
 
     changed_docs = fetch_changed_docs(session, token, last_ewx_check_ms, state.category_map)
-    affected = apply_changed_docs(state, changed_docs)
-    logging.info("EWX probe: %d changed doc(s) → %d affected project(s).",
-                 len(changed_docs), len(affected))
+    affected, new_docs = apply_changed_docs(state, changed_docs)
+    # When announcements are disabled, drop the new-doc list so nothing is posted
+    # and new threads fall back to a plain crew ping (empty new_docs_by_pn).
+    if not ANNOUNCE_NEW_DOCS:
+        new_docs = []
+    new_docs_by_pn: dict[str, list[Document]] = {}
+    for d in new_docs:
+        new_docs_by_pn.setdefault(d.projectNumber, []).append(d)
+    logging.info("EWX probe: %d changed doc(s) (%d new) → %d affected project(s).",
+                 len(changed_docs), len(new_docs), len(affected))
 
     if last_notion_check_iso is not None:
         changed_pages = fetch_changed_notion_pages(state.data_source_id, last_notion_check_iso)
@@ -1434,8 +1576,11 @@ def incremental_sync(session, token, state: SyncState,
 
     # Job channels & vermietungen threads need the full project list; only run when
     # at least one project changed (cheap relative to a tick that pushed real diffs).
+    # Channels/threads are created here, before announce_new_docs, so a brand-new
+    # project's destination exists by the time we post its first message.
     sync_job_channels(list(state.projects.values()), state.discord_by_pn)
-    sync_vermietungen_threads(list(state.projects.values()), state)
+    announced = sync_vermietungen_threads(list(state.projects.values()), state, new_docs_by_pn)
+    announce_new_docs(new_docs, state, announced)
 
     save_state_to_disk(state)
     return tick_ms, tick_iso
@@ -1478,8 +1623,8 @@ def main():
     data_source_id = resolve_notion_data_source_id()
     state = new_empty_state(data_source_id)
 
-    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds, debug=%s.",
-                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS, DEBUG)
+    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds, debug=%s, announce_new_docs=%s.",
+                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS, DEBUG, ANNOUNCE_NEW_DOCS)
 
     session = auth_token = None
     first_tick = True

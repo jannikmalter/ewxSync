@@ -44,6 +44,7 @@ No build step, test runner, or linter is configured.
 | `DISCORD_VERMIETUNGEN_CHANNEL_ID` | Channel that holds one thread per Technikmiete project. Required for `sync_vermietungen_threads`. |
 | `DISCORD_JOBS_CATEGORY_ID` | Category under which non-Technikmiete project channels are created. Required for `sync_job_channels`. |
 | `DISCORD_CREW_ROLE_ID` | Role to mention when a vermietungen thread is created, so its members auto-subscribe to the thread. Optional — when unset, the crew ping is skipped. |
+| `ANNOUNCE_NEW_DOCS` | `true`/`1`/`yes`/`on` (default `true`) enables the Discord "`<Type> <job>` has been created!" messages. Set to `false`/`0`/`no`/`off` to kill the feature: no per-document messages are posted and new threads fall back to a plain crew ping. Optional. |
 | `DEBUG` | `true`/`1`/`yes`/`on` puts the daemon in dry-run / observation mode: every external write (Notion page create/update, Discord channel create, channel topic update, thread create/rename/archive/unarchive, crew ping) is logged with a `[DRY-RUN]` prefix instead of called, and a snapshot of in-memory state is written to disk after every tick. Off by default. The daemon never reads from disk in any mode. |
 
 ## Architecture
@@ -60,7 +61,8 @@ No build step, test runner, or linter is configured.
 | `sync_job_channels()` | Create a Discord channel for each active non-Technikmiete project that lacks one. |
 | `sync_vermietungen_threads()` | Maintain one thread per active Technikmiete project; backfill the crew ping into threads that don't have one yet. |
 | `meaningful_diffs()` | Notion-write gate: only diff on fields whose new value is non-empty, so empty EWX data never clears Notion. |
-| `ping_crew_in_thread()` / `thread_has_crew_ping()` | Send the role mention that auto-subscribes Crew members; detect whether a thread already received one. |
+| `ping_crew_in_thread()` / `thread_has_crew_ping()` | Send the role mention that auto-subscribes Crew members (optionally prefixed with announcement lines); detect whether a thread already received one. |
+| `announce_new_docs()` | Post a "`<Type> <job>` has been created!" message into a project's channel/thread for each newly created EWX document (incremental ticks only). |
 
 ### Sync model
 
@@ -96,7 +98,7 @@ One Eventworx login at startup is reused across ticks; the session is only re-es
 1. **EWX probe** — `fetch_changed_docs(session, token, last_ewx_check_ms)` paginates `/backend/job` with `filter=lastModification|* > last_ewx_check_ms`. Each returned doc replaces its entry in `state.docs_by_pn[pn][doc_key]` (or is inserted if new). The set of affected `projectNumber`s drives re-aggregation via `aggregate_one_project()`.
 2. **Notion probe** — `fetch_changed_notion_pages(data_source_id, last_notion_check_iso)` uses Notion's `last_edited_time` `on_or_after` filter. Returned pages overwrite `state.notion_entries[pn]` verbatim — the in-memory mirror always matches Notion. Self-edits re-appear here on the next tick; that's expected (it keeps the mirror correct) and they yield no diff against the EWX-derived desired state, so no push loop occurs.
 
-After probes, the union of affected projects is pushed via `push_projects()`. Each project: `push_project_to_notion()` diffs against the in-memory mirror via `meaningful_diffs` and writes on divergence (mirror then refreshed from the API response so it stays perfectly aligned with Notion); `push_project_to_discord_topic()` diffs the topic and PATCHes the channel if EWX or Notion URLs changed. `sync_job_channels()` and `sync_vermietungen_threads()` run only when at least one project was affected.
+After probes, the union of affected projects is pushed via `push_projects()`. Each project: `push_project_to_notion()` diffs against the in-memory mirror via `meaningful_diffs` and writes on divergence (mirror then refreshed from the API response so it stays perfectly aligned with Notion); `push_project_to_discord_topic()` diffs the topic and PATCHes the channel if EWX or Notion URLs changed. `sync_job_channels()` and `sync_vermietungen_threads()` run only when at least one project was affected. Finally `announce_new_docs()` posts a "has been created" message for each newly created document (see [Document-created announcements](#document-created-announcements)).
 
 Each tick:
 1. **Capture timestamps before any fetch.** `tick_ms = int(time.time() * 1000)` and `tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()` are the candidate checkpoints. Captured first so anything modified during the tick is re-probed on the next pass.
@@ -129,11 +131,12 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 
   ELSE:
     incremental_sync(session, token, state, last_ewx_check, last_notion_check):
-      fetch_changed_docs        → apply_changed_docs   → affected EWX PNs
+      fetch_changed_docs        → apply_changed_docs   → affected EWX PNs + new docs
       fetch_changed_notion_pages → apply_changed_notion → affected Notion PNs
       IF affected: push_projects(affected) → per-project Notion + Discord topic
                    sync_job_channels (full list)
-                   sync_vermietungen_threads (full list)
+                   sync_vermietungen_threads (full list) → folds new-doc lines into new threads
+                   announce_new_docs(new docs) → "has been created" per new doc
                    save_state_to_disk    (no-op unless DEBUG=true)
 
   advance last_ewx_check_ms = tick_ms, last_notion_check_iso = tick_iso
@@ -151,6 +154,7 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 | `projects` | `dict[pn, ProjectSummary]` | Derived view of `docs_by_pn`, rebuilt on full sync and patched on incremental ticks. |
 | `notion_entries` | `dict[pn, {page_id, last_edited_time, obj}]` | Perfect mirror of Notion. `obj` is the `ProjectSummary` extracted from the page. Refreshed from API responses on every write. |
 | `discord_by_pn` | `dict[pn, DiscordChannel]` | Mirror of Discord channels carrying an `[EWX:P-XXXX]` tag. |
+| `discord_threads_by_pn` | `dict[pn, DiscordThread]` | Vermietungen threads keyed by project number, refreshed each time `sync_vermietungen_threads()` runs. Drives message routing for `announce_new_docs()`. |
 | `data_source_id` | `str` | Cached Notion data source id, resolved once at startup. |
 | `category_map` | `dict[category_id, name]` | EWX category id → name. Refreshed on full sync. |
 | `thread_crew_pinged` | `dict[threadId, bool]` | True once a Crew role mention is confirmed/sent in the thread. Persists across ticks but not restarts. |
@@ -214,23 +218,35 @@ Relevant channels carry an `[EWX:P-XXXX]` tag in their topic — this is the joi
 - **Channel naming**: `YYMMDD title` from the project's `rentStartDate` (e.g. `261205 Sommerfest Müller`), truncated to 100 chars (`build_channel_name`). When `rentStartDate` is missing, the date prefix is omitted. Discord normalizes the name (lowercase, spaces → `-`) on creation.
 - **Topic on creation**: pre-populated with `[EWX:P-XXXX](url)` so the per-project topic-update pass is a no-op for the new channel.
 - **Lifecycle**: create-only. No archive, move, or delete when a project leaves the target set — channel relocation on completion is a manual step (see `goals.md`).
-- Newly created channels are inserted into `state.discord_by_pn` so the subsequent per-project loop sees them.
+- Newly created channels are inserted into `state.discord_by_pn` so the subsequent per-project loop sees them. Under `DEBUG=true` a *synthetic* channel (fake `dry-run:P-XXXX` id) is inserted instead, so the dry-run's topic-update and `announce_new_docs()` passes route identically to a real run. The fake id is never used for an API call — all writes are gated behind `DEBUG`.
 
 ### Vermietungen threads (Technikmiete jobs)
 
 `sync_vermietungen_threads()` manages one thread per active `Technikmiete` project inside the channel specified by `DISCORD_VERMIETUNGEN_CHANNEL_ID`.
 
 - **Target set**: projects with `status == "Aktiv"` AND `"Technikmiete" in categories`.
-- **Thread naming**: `P-XXXX_title`, truncated to 100 chars (`build_thread_name`). The `P-XXXX_` prefix is the join key — parsed via `_THREAD_PREFIX_RE`. Threads in this channel without that prefix are ignored.
+- **Thread naming**: `P-XXXX | DD.MM. title` (e.g. `P-1234 | 05.12. Sommerfest Müller`), truncated to 100 chars (`build_thread_name`). The `DD.MM.` part comes from the project's `rentStartDate` and is omitted when unset. The `P-XXXX` prefix is the join key — parsed via `_THREAD_PREFIX_RE`, which also accepts the legacy `P-XXXX_title` format so pre-existing threads get renamed in place instead of duplicated. Threads in this channel without either prefix shape are ignored.
 - **Reconciliation**:
   - Target project with no active thread → unarchive a matching archived thread if one exists, otherwise create a new public thread (`type=11`, no starter message, 7-day auto-archive).
   - Active thread whose project left the target set → PATCH `archived: true` (never deleted).
   - Active thread still in target set whose name diverges from `build_thread_name(...)` → rename in place (e.g. when the Eventworx title changes).
 - Archived threads are only listed on demand (when at least one target project lacks an active thread), to avoid the extra paginated API call when not needed.
 
-**Crew ping** (`ping_crew_in_thread`, `thread_has_crew_ping`): on thread creation, the bot posts a `<@&DISCORD_CREW_ROLE_ID>` mention with `[Eventworx](<url>) · [Notion](<url>)` links. Mentioning the role auto-subscribes its members to the thread — that's the entire mechanism. The Notion URL is available because `push_projects()` runs before `sync_vermietungen_threads()` and refreshes `state.notion_entries[pn]["obj"].notionUrl` from the create response.
+**Crew ping** (`ping_crew_in_thread`, `thread_has_crew_ping`): on thread creation, the bot posts a `<@&DISCORD_CREW_ROLE_ID>` mention with `[Eventworx](<url>) · [Notion](<url>)` links. Mentioning the role auto-subscribes its members to the thread — that's the entire mechanism. The Notion URL is available because `push_projects()` runs before `sync_vermietungen_threads()` and refreshes `state.notion_entries[pn]["obj"].notionUrl` from the create response. When the thread is created in the same tick that introduced new EWX documents, those documents' "has been created" lines are folded into this single intro message (above the mention) via the `header_lines` argument, so the announcement is genuinely the thread's first message. The message posts even when `DISCORD_CREW_ROLE_ID` is unset, as long as there are announcement lines to deliver.
 
 Existing threads without a crew ping are backfilled in a final pass over the target set. To avoid re-checking every thread on every tick, the result is recorded in `state.thread_crew_pinged: dict[threadId, bool]` — once `True`, the API check is skipped permanently within the daemon's lifetime. The flag is in-memory only; a daemon restart re-verifies via Discord's message history (one `GET /messages?after=0&limit=50` per thread), then settles back to zero API checks.
+
+### Document-created announcements
+
+`announce_new_docs()` posts a one-line message into a project's Discord destination whenever a **new** EWX document appears: `Order [AU-1234](<url>) has been created!` (every docType — order, offer, request, deliverynote, invoice). The job number links to the Eventworx deep-link (`eventworx_doc_url`), angle-bracketed to suppress Discord's embed.
+
+- **What counts as "new"**: `apply_changed_docs()` returns the docs whose `_doc_key` (`docType:docId`) was absent from `state.docs_by_pn` before this tick merged it. Because `fetch_changed_docs` returns both created *and* modified docs, this key-presence check is what distinguishes a creation from an edit. Modifications announce nothing.
+- **Incremental only**: full sync rebuilds `docs_by_pn` from scratch and never calls `apply_changed_docs`/`announce_new_docs`, so a daemon restart (which full-syncs) never replays the whole history into Discord.
+- **Routing** (`discord_destination`): Technikmiete → the active vermietungen thread (`state.discord_threads_by_pn`); otherwise → the job channel (`state.discord_by_pn`). Runs *after* `sync_job_channels()` and `sync_vermietungen_threads()` so a brand-new project's channel/thread already exists. A doc whose project has no destination (e.g. never became Aktiv) is silently skipped.
+- **No double-post on new threads**: `sync_vermietungen_threads()` returns the set of project numbers whose new docs it already folded into a freshly created thread's intro message; `announce_new_docs()` skips those.
+- **At-most-once**: the new-doc list is derived in memory and never persisted. If a tick fails after the doc is merged but before the announce pass, the doc is already in the mirror next tick and won't re-announce. Acceptable for notifications.
+- **DEBUG**: each would-be message logs `[DRY-RUN] Would announce …`; summary line `Announcements: N sent, M skipped (no destination).` (verb becomes `would-send`).
+- **Kill-switch**: `ANNOUNCE_NEW_DOCS=false` disables the whole feature — `incremental_sync()` clears the new-doc list, so nothing is posted and new threads fall back to a plain crew ping.
 
 ### Logging convention
 
