@@ -70,6 +70,11 @@ ACTIVE_OFFER_STATUSES = {"draft", "sent", "open", "accepted"}
 CLOSED_STATUSES       = {"finished", "completed", "fullypaid"}
 CANCELLED_STATUSES    = {"rejected", "cancelled"}
 
+# Deal types that count as a live project. "rent" is equipment hire; "sale" is
+# service-only work (no equipment rented) that still needs managing in Notion/Discord.
+# Eventworx's own "active" views only show rent, but we intentionally track sale too.
+ACTIVE_DEAL_TYPES     = {"rent", "sale"}
+
 # Priority for picking the representative doc on closed projects.
 # Invoice is the final stage of the lifecycle and carries the most complete information.
 # Delivery notes rank below order/offer — they can deviate from the agreed contract,
@@ -92,7 +97,7 @@ class Document:
     jobNumber: str
     projectNumber: str
     docType: str
-    dealType: str           # "rent" | "sale" | None — only rent is tracked as active
+    dealType: str           # "rent" | "sale" | None — rent and sale both count as active
     title: str
     status: str
     activation: str | None  # None | "archived" | "active" | "deleted"
@@ -228,9 +233,11 @@ def classify_project(docs: list[Document], now_ms: int) -> tuple[str, Document]:
     """
     Determine a project's status and pick its representative document.
 
-    Mirrors Eventworx's own "active" filter logic (reverse-engineered from UI requests):
-    - A live order (non-archived, dealType=rent, status in ACTIVE_ORDER_STATUSES) makes
-      the project Aktiv. When a live order exists, offers are implicitly superseded.
+    Mirrors Eventworx's own "active" filter logic (reverse-engineered from UI requests),
+    extended to also count "sale" (service-only) deals, not just "rent":
+    - A live order (non-archived, dealType in ACTIVE_DEAL_TYPES, status in
+      ACTIVE_ORDER_STATUSES) makes the project Aktiv. When a live order exists, offers
+      are implicitly superseded.
     - A live offer (same conditions plus status in ACTIVE_OFFER_STATUSES and endDate still
       in the future) makes the project Aktiv only when no live order exists.
     - Otherwise the project is closed; the terminal status of the most recently modified
@@ -244,7 +251,7 @@ def classify_project(docs: list[Document], now_ms: int) -> tuple[str, Document]:
                    if d.docType == "order"
                    and d.status in ACTIVE_ORDER_STATUSES
                    and d.activation != "archived"
-                   and d.dealType == "rent"]
+                   and d.dealType in ACTIVE_DEAL_TYPES]
     if live_orders:
         return "Aktiv", max(live_orders, key=lambda d: d.modificationDate or 0)
 
@@ -263,7 +270,7 @@ def classify_project(docs: list[Document], now_ms: int) -> tuple[str, Document]:
     live_offers = [d for d in latest_offer_per_job.values()
                    if d.status in ACTIVE_OFFER_STATUSES
                    and d.activation != "archived"
-                   and d.dealType == "rent"
+                   and d.dealType in ACTIVE_DEAL_TYPES
                    and (d.endDate is None or d.endDate > now_ms)]
     if live_offers:
         return "Aktiv", max(live_offers, key=lambda d: d.modificationDate or 0)

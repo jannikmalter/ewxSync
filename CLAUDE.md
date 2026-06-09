@@ -67,7 +67,7 @@ No build step, test runner, or linter is configured.
 ### Sync model
 
 - Documents from EWX are grouped by `projectNumber` into `ProjectSummary` objects.
-- `classify_project()` picks the representative doc using the same logic Eventworx's UI uses for its "active orders/offers" views: status sets per docType, `activation != "archived"`, `dealType == "rent"`, and `endDate > now` for offers.
+- `classify_project()` picks the representative doc using the same logic Eventworx's UI uses for its "active orders/offers" views: status sets per docType, `activation != "archived"`, `dealType in {rent, sale}`, and `endDate > now` for offers. (Eventworx's own "active" views only show `rent`; we intentionally also track `sale` — service-only jobs with no rented equipment — so they appear as Aktiv in Notion/Discord. See `ACTIVE_DEAL_TYPES`.)
 - Project status has three values:
   - `Aktiv` — a live order or live offer exists
   - `Abgeschlossen` — closed
@@ -166,7 +166,7 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 | `jobNumber` | `str` | EWX job number, e.g. `AN-1073-01`. |
 | `projectNumber` | `str` | EWX project number, e.g. `P-1234`. Join key. |
 | `docType` | `str` | `order`, `offer`, `request`, `delivery`, `invoice`. |
-| `dealType` | `str \| None` | `rent` or `sale`. Only `rent` is tracked as Aktiv. |
+| `dealType` | `str \| None` | `rent` or `sale`. Both count as Aktiv (`ACTIVE_DEAL_TYPES`); `sale` = service-only jobs without rented equipment. |
 | `title` | `str` | |
 | `status` | `str` | Doc-level status, see "Active status sets". |
 | `activation` | `str \| None` | `None` (live) \| `"archived"` \| `"active"` \| `"deleted"`. |
