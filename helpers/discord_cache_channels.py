@@ -19,7 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
 TARGET_CATEGORY_ID = 1078233039705997412
-CACHE_FILE = "local_discord_channels.json"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
+CACHE_FILE = os.path.join(CACHE_DIR, "local_discord_channels.json")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -48,6 +49,7 @@ async def on_ready():
         for ch in sorted(cat.channels, key=lambda c: c.position)
     ]
 
+    os.makedirs(CACHE_DIR, exist_ok=True)
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(channels, f, ensure_ascii=False, indent=2)
 

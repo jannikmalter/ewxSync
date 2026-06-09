@@ -5,9 +5,11 @@ AI-assisted Discord channel matching.
 """
 
 import json
+import os
 
-INPUT = "local_eventworx_projects.json"
-OUTPUT = "local_eventworx_slim.json"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
+INPUT = os.path.join(CACHE_DIR, "local_eventworx_projects.json")
+OUTPUT = os.path.join(CACHE_DIR, "local_eventworx_slim.json")
 
 with open(INPUT, encoding="utf-8") as f:
     projects = json.load(f)

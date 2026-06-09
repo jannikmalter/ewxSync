@@ -6,23 +6,48 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **ewxSync** synchronizes Eventworx (event management SaaS) job data into Notion and Discord. The daemon runs purely in memory: each tick fetches fresh data from EWX (and optionally Notion), diffs against the in-memory mirror, and pushes only changes.
 
-- `ewxSync.py` — the active daemon. All sync logic lives here.
-- `ewxApiTest.py` — standalone probe for hand-testing single Eventworx endpoints. Logs in, fires one configurable request, dumps the response to `ewx_api_test_response.json`, logs out. Useful when reverse-engineering new filter/sort fields.
-- `notionDiscord.py` — old prototype (Discord bot that mirrored new channels to Notion). No longer used.
+- `ewxSync.py` — the active daemon (repo root). All sync logic lives here.
+- `goals.md` — roadmap (open/done feature goals) and the **prioritized bugfix backlog**. Check it before assuming a quirk is intended behavior: known open bugs (P2/P3) are listed there, not fixed silently.
 - `eventworx API analysis.md` — reverse-engineered notes on EWX request shapes and filter values.
+- `helpers/` — standalone, manually-run scripts; none are part of the daemon:
+  - `ewxApiTest.py` — probe for hand-testing single Eventworx endpoints. Logs in, fires one configurable request, dumps the response to `cache/ewx_api_test_response.json`, logs out. Useful when reverse-engineering new filter/sort fields.
+  - `fetch_locales.py` — pulls the EWX locale table (`<base>/eventworx/resources/locales/<locale>.json`, the dict `EwLocales` loads at runtime) and writes `cache/locale_<locale>.json`. Source of the per-docType `Common.JobStatusMap` status→label tree behind `STATUS_LABELS`.
+  - `beautify_app.py` — reformats the minified `cache/app.js` Eventworx bundle into readable, line-navigable `cache/app.pretty.js` (via `jsbeautifier`).
+  - `discord_list_channels.py` / `discord_cache_channels.py` / `discord_apply_tags.py` — one-off Discord channel inspection, caching, and `[EWX:…]` tagging utilities.
+  - `reduce_ewx_cache.py` — slims `cache/local_eventworx_projects.json` to the fields needed for AI-assisted Discord channel matching.
+  - `notionDiscord.py` — old prototype (Discord bot that mirrored new channels to Notion). No longer used.
+- `cache/` — git-ignored scratch space holding every generated JSON and JS file: daemon debug snapshots, raw API dumps, locale pulls, and the `app.js`/`app.pretty.js` bundles. Nothing here is read by the daemon (see [Local snapshots](#local-snapshots-debug-only-git-ignored)).
+
+### Where to look things up (reference files)
+
+| Question | Look in |
+|---|---|
+| How does an EWX endpoint/filter/status behave? | [eventworx API analysis.md](eventworx%20API%20analysis.md) — endpoints, filter language, Solr↔response field map, status vocabularies, per-docType label tables, verified findings (project entity, REST API, docSubType). |
+| Is this quirk a known bug? What's planned? | [goals.md](goals.md) — feature roadmap, prioritized bugfix backlog, "Watching Eventworx" items. |
+| What does the EWX frontend *actually* do? | `cache/app.pretty.js` — beautified frontend bundle, the ground truth for reverse-engineering. **~500k lines — never read whole; Grep first, then Read the hit ±50 lines.** Regenerate from a fresh `cache/app.js` via `helpers/beautify_app.py`. Entry points: models `Ext\.cmd\.derive\('EventWorx\.model\.<Name>'` (Job, Project, Notes, JobTodoListEntry…); status stores `lookups\.JobStatus` / `JobStatusMap`; backend route map `EventWorx.controller.EventWorxConfig` (search `backendUrl:`); view filter logic `case_offer` / `case_order` / `selectedPhase`. |
+| What label does the UI render for a status? | `cache/locale_de.json` — runtime locale table (`Common.JobStatusMap` = per-docType status→German label). Refetch via `helpers/fetch_locales.py`. |
+| What does the official REST API support? | `cache/eventworx-api.yaml` — snapshot of https://api-doc.eventworx.biz/eventworx-api.yaml (Swagger 2.0; auth header `S-API-TOKEN`). Re-download and diff after EWX updates. |
+| What does a raw API response look like? | `cache/all_eventworx_raw.json` (full `/backend/job` dump, written by a DEBUG full sync); `cache/ewx_api_test_response.json` (single-endpoint probes via `helpers/ewxApiTest.py`). |
+| One-off live probes | `cache/probe_project.py` (+ `probe_project_response.json`) — `/backend/project` probe; pattern to copy for new throwaway probes (login with `forceLogoff=false` fails harmlessly if the daemon holds the license). |
+
+Line numbers in past findings refer to the current `app.pretty.js` and **drift whenever Eventworx ships a new bundle** — always re-grep instead of trusting saved offsets.
 
 ## Running Scripts
 
-```bash
-# Activate the virtual environment first
-source .venv/bin/activate
+The repo's `.venv` is a **Windows** venv (`.venv\Scripts\`).
+
+```powershell
+# Activate the virtual environment first (PowerShell)
+.venv\Scripts\Activate.ps1
 
 # Main sync daemon (long-running)
 python ewxSync.py
 
-# Dump in-memory state to local *.json files after every tick (for inspection)
-DEBUG=true python ewxSync.py
+# Dry-run mode: log all writes as [DRY-RUN] and dump in-memory state to cache/*.json
+$env:DEBUG = "true"; python ewxSync.py
 ```
+
+On Linux (e.g. production host): `source .venv/bin/activate` and `DEBUG=true python ewxSync.py`.
 
 Stop with Ctrl+C / SIGTERM — the daemon logs out cleanly via a signal handler.
 
@@ -96,16 +121,16 @@ One Eventworx login at startup is reused across ticks; the session is only re-es
 
 **Full sync** — runs on the first tick (checkpoints start `None`) and at least once every `FULL_SYNC_INTERVAL_SECONDS` (default 86400 = daily). Fetches everything fresh (all EWX docs, all Notion entries, all Discord channels), replaces in-memory state, and pushes every project. Safety net for drift, hard deletes, and missed probes. `state.thread_crew_pinged` is *not* reset — confirmations accumulated during the daemon's lifetime carry over so the per-tick crew-ping check stays at zero once every thread is known.
 
-**Incremental sync** — every other tick. Two parallel probes:
+**Incremental sync** — every tick that isn't a full sync. Two probes, run sequentially:
 1. **EWX probe** — `fetch_changed_docs(session, token, last_ewx_check_ms)` paginates `/backend/job` with `filter=lastModification|* > last_ewx_check_ms`. Each returned doc replaces its entry in `state.docs_by_pn[pn][doc_key]` (or is inserted if new). The set of affected `projectNumber`s drives re-aggregation via `aggregate_one_project()`.
 2. **Notion probe** — `fetch_changed_notion_pages(data_source_id, last_notion_check_iso)` uses Notion's `last_edited_time` `on_or_after` filter. Returned pages overwrite `state.notion_entries[pn]` verbatim — the in-memory mirror always matches Notion. Self-edits re-appear here on the next tick; that's expected (it keeps the mirror correct) and they yield no diff against the EWX-derived desired state, so no push loop occurs.
 
 After probes, the union of affected projects is pushed via `push_projects()`. Each project: `push_project_to_notion()` diffs against the in-memory mirror via `meaningful_diffs` and writes on divergence (mirror then refreshed from the API response so it stays perfectly aligned with Notion); `push_project_to_discord_topic()` diffs the topic and PATCHes the channel if EWX or Notion URLs changed. `sync_job_channels()` and `sync_vermietungen_threads()` run only when at least one project was affected. Finally `announce_new_docs()` posts a "has been created" message for each newly created document (see [Document-created announcements](#document-created-announcements)) and `announce_status_changes()` posts a "changed its status to X" message for each document whose status changed (see [Document status-change announcements](#document-status-change-announcements)).
 
 Each tick:
-1. **Capture timestamps before any fetch.** `tick_ms = int(time.time() * 1000)` and `tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()` are the candidate checkpoints. Captured first so anything modified during the tick is re-probed on the next pass.
+1. **Capture timestamps before any fetch.** `tick_ms = int(time.time() * 1000)` and `tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()` are the candidate checkpoints. Captured first so anything modified during the tick is re-probed on the next pass. (`full_sync()` likewise captures its own `now_ms` at the top, before `fetch_all_docs` — re-processing the overlap is idempotent.)
 2. **Run full_sync or incremental_sync.**
-3. **Advance checkpoints only on full success.** `last_ewx_check_ms`, `last_notion_check_iso`, and (on full ticks) `last_full_sync_at_ms` live in `main()`'s local scope. Any exception aborts before this step, so the same window is retried next tick. When `DEBUG=true`, the checkpoints are also written to `sync_state.json`.
+3. **Advance checkpoints only on full success.** `last_ewx_check_ms`, `last_notion_check_iso`, and (on full ticks) `last_full_sync_at_ms` live in `main()`'s local scope. Any exception aborts before this step, so the same window is retried next tick. When `DEBUG=true`, the checkpoints are also written to `cache/sync_state.json`.
 4. **Re-login is reactive.** If anything in the tick raises, the session is dropped (best-effort logout) and `try_login()` runs at the top of the next tick. No proactive token refresh.
 
 Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls the flag at 1s granularity so Ctrl+C exits promptly. The `finally` clause in `main()` logs out before returning.
@@ -144,7 +169,7 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 
   advance last_ewx_check_ms = tick_ms, last_notion_check_iso = tick_iso
   on full sync also: last_full_sync_at_ms = tick_ms
-  → save sync_state.json    (no-op unless DEBUG=true)
+  → save cache/sync_state.json    (no-op unless DEBUG=true)
 ```
 
 ### Data structures
@@ -168,7 +193,7 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 |---|---|---|
 | `jobNumber` | `str` | EWX job number, e.g. `AN-1073-01`. |
 | `projectNumber` | `str` | EWX project number, e.g. `P-1234`. Join key. |
-| `docType` | `str` | `order`, `offer`, `request`, `delivery`, `invoice`. |
+| `docType` | `str` | `order`, `offer`, `request`, `deliverynote`, `invoice` (rarely `clearance`, `repair`). |
 | `dealType` | `str \| None` | `rent` or `sale`. Both count as Aktiv (`ACTIVE_DEAL_TYPES`); `sale` = service-only jobs without rented equipment. |
 | `title` | `str` | |
 | `status` | `str` | Doc-level status, see "Active status sets". |
@@ -190,7 +215,7 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 | `representativeJob` | `str` | E.g. `AN-1073-01`. |
 | `representativeDocType` | `str` | `order` / `offer` / etc. |
 | `categories` | `list[str]` | Union across all docs in the project. |
-| `has_order` / `has_offer` / `has_request` / `has_delivery` / `has_invoice` | `bool` | Reflects presence of any non-cancelled, non-archived doc of that type. |
+| `has_order` / `has_offer` / `has_request` / `has_delivery` / `has_invoice` | `bool` | Presence of **any** doc of that type in the project — no status/activation filtering. (`has_delivery` maps docType `deliverynote`.) |
 | `icon` | `str \| None` | URL or emoji string. Read from Notion; only set on Notion when not already set. |
 | `representativeUrl` | `str \| None` | EWX deep-link to the representative doc. Embedded as `text.link` on the Notion `Project Number` field and written into the Discord channel topic EWX tag. |
 | `notionUrl` | `str \| None` | URL of the Notion page. Read from Notion and stored in `state.notion_entries`; never written back to Notion, never diffed. Used to populate the Discord topic Notion tag. |
@@ -253,10 +278,10 @@ Existing threads without a crew ping are backfilled in a final pass over the tar
 
 ### Document status-change announcements
 
-`announce_status_changes()` posts a one-line message into a project's Discord destination whenever an **existing** EWX document's `status` field changes: `Order [AU-1234](<url>) changed its status to finished!`. The status is the **raw Eventworx value** (`finished`, `cancelled`, `ordered`, `accepted`, `fullypaid`, …) — no friendly relabeling. Same link/routing/skip semantics as document-created announcements. Differences from that feature:
+`announce_status_changes()` posts a one-line message into a project's Discord destination whenever an **existing** EWX document's `status` field changes: `Order [AU-1234](<url>) changed its status to completed!`. The raw Eventworx status code is translated to a friendly **per-docType** English label via `status_label()` / `STATUS_LABELS` — necessary because the raw codes are terse and the same code renders differently per docType (an `order`'s `sent` is "confirmed", an `offer`'s `sent` is "sent"). The English labels translate the authoritative German per-docType labels from Eventworx's runtime locale table (`Common.JobStatusMap` in `de.json`, pulled via `helpers/fetch_locales.py`; this instance is German-only). See [eventworx API analysis.md](eventworx%20API%20analysis.md) for the full tree and the per-docType gotchas. The API exposes no display label, so the mapping lives in code; any docType/status not in the table falls back to the raw code. Same link/routing/skip semantics as document-created announcements. Differences from that feature:
 
 - **What counts as a "status change"**: `apply_changed_docs()` compares each changed doc's `status` against the mirrored value *before* overwriting it. A doc is in `status_changes` when its `_doc_key` already existed and the new `status` is non-empty and differs. Creations are never status changes (a doc is either new or a possible status change, never both). Sub-status fields (`deliveryStatus`, `invoiceStatus`) are **not** tracked — only the main `status`.
-- **All transitions announced**: every status change for every docType is posted (no curated subset). Observed `status` values per docType are catalogued in [eventworx API analysis.md](eventworx%20API%20analysis.md).
+- **All transitions announced**: every status change for every docType is posted (no curated subset). Observed `status` values per docType are catalogued in [eventworx API analysis.md](eventworx%20API%20analysis.md), and each is mapped to a friendly English label in `STATUS_LABELS`.
 - **Not folded into thread intros**: unlike creations, status changes are never merged into a freshly created thread's intro message — they always post as their own message, so there is no `announced_pns` skip set.
 - **Incremental only / at-most-once / DEBUG**: identical to document-created announcements. Summary line: `Status announcements: N sent, M skipped (no destination).`
 - **Kill-switch**: `ANNOUNCE_STATUS_CHANGES=false` disables the feature independently of `ANNOUNCE_NEW_DOCS`.
@@ -270,29 +295,35 @@ One log line per *change*, one summary line for the *no-ops*. Each subsystem pri
 
 Under `DEBUG=true` every would-be write (Notion + Discord) is prefixed with `[DRY-RUN]` so the log reads identically to a real run minus the API calls.
 
-### Eventworx auth
+### HTTP conventions & Eventworx auth
 
-Login uses `license: READONLY` to avoid consuming a full user license. The `X-AUTH-TOKEN` header from the login response must be included in all subsequent requests. Always call `logout()` — a `try/finally` block ensures this even on error.
+**Timeouts**: every EWX and Discord call goes through `TimeoutSession`, a `requests.Session` subclass that defaults `timeout` to `HTTP_TIMEOUT = (10, 60)` (connect, read) — `try_login()` returns one for EWX, and the module-level `_http` session handles all Discord calls. Never add a bare `requests.get/post/patch` call; use the session so a stalled connection raises instead of hanging the daemon forever. (Notion calls go through notion-client, which has its own 60s default.)
+
+**Login** uses `license: READONLY` to avoid consuming a full user license. The `X-AUTH-TOKEN` header from the login response must be included in all subsequent requests. `try_login()` **raises** on every failure path (never exits the process) so the daemon's tick handler retries next tick. On `LICENSE-NOT-AVAILABLE` it retries once with `forceLogoff: "true"` to reclaim a stale session (e.g. our own, after a hard crash that skipped logout). **Caution**: this means a second concurrently running instance — including a local test login — will kick the production daemon off the license. Always call `logout()` — a `try/finally` block ensures this even on error.
 
 ### Local snapshots (debug-only, git-ignored)
 
-None of these files are read by the daemon. They are written only when `DEBUG=true` is set in the environment, as point-in-time snapshots of in-memory state for inspection and debugging. Deleting them has no effect on behavior.
+None of these files are read by the daemon. They live under `cache/` (git-ignored) and are written only when `DEBUG=true` is set in the environment, as point-in-time snapshots of in-memory state for inspection and debugging. Deleting them has no effect on behavior.
 
 | File | What it contains when `DEBUG=true` |
 |---|---|
-| `local_eventworx_docs.json` | Raw EWX `Document` records grouped by `projectNumber` and keyed by `docType:docId`. |
-| `local_eventworx_projects.json` | Aggregated `ProjectSummary` snapshot — derived view of `local_eventworx_docs.json`. |
-| `local_notion_projects.json` | Mirror of Notion at the end of the last tick. Each entry stores `page_id`, `last_edited_time`, and the `ProjectSummary` extracted from the page. |
-| `local_discord_channels.json` | Snapshot of Discord channels carrying an `[EWX:P-XXXX]` tag. |
-| `local_discord_threads.json` | Snapshot of vermietungen threads including the in-memory `crewPinged` flag for each. |
-| `all_eventworx_raw.json` | Raw API response dump from the most recent full sync. |
-| `sync_state.json` | Snapshot of `last_full_sync_at_ms`, `last_ewx_check_ms`, `last_notion_check_iso`. |
-| `ewx_api_test_response.json` | Output of `ewxApiTest.py` probes; unrelated to the daemon. |
+| `cache/local_eventworx_docs.json` | Raw EWX `Document` records grouped by `projectNumber` and keyed by `docType:docId`. |
+| `cache/local_eventworx_projects.json` | Aggregated `ProjectSummary` snapshot — derived view of `cache/local_eventworx_docs.json`. |
+| `cache/local_notion_projects.json` | Mirror of Notion at the end of the last tick. Each entry stores `page_id`, `last_edited_time`, and the `ProjectSummary` extracted from the page. |
+| `cache/local_discord_channels.json` | Snapshot of Discord channels carrying an `[EWX:P-XXXX]` tag. |
+| `cache/local_discord_threads.json` | Snapshot of vermietungen threads including the in-memory `crewPinged` flag for each. |
+| `cache/all_eventworx_raw.json` | Raw API response dump from the most recent full sync. |
+| `cache/sync_state.json` | Snapshot of `last_full_sync_at_ms`, `last_ewx_check_ms`, `last_notion_check_iso`. |
+| `cache/ewx_api_test_response.json` | Output of `helpers/ewxApiTest.py` probes; unrelated to the daemon. |
 
 ## Dependencies
 
 ```bash
-pip install requests notion-client discord.py python-dotenv
+# Daemon (ewxSync.py) — talks to Discord via raw REST, no discord.py needed
+pip install requests notion-client python-dotenv
+
+# Helpers only: discord.py for the discord_* scripts, jsbeautifier for beautify_app.py
+pip install discord.py jsbeautifier
 ```
 
 Python 3.10+ required (uses `int | None` union syntax in ewxSync.py). A `.env` file at the repo root supplies the environment variables listed under [Configuration](#configuration); `python-dotenv` loads it at startup.

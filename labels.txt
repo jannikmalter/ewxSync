@@ -1,0 +1,202 @@
+Ext.cmd.derive('EventWorx.store.lookups.JobStatus', Ext.data.Store, {
+    constructor: function(a) {
+        var b = this;
+        a = a || {};
+        Ext.data.Store.prototype.constructor.call(this, Ext.apply({
+            storeId: 'lookups.JobStatus',
+            data: [{
+                displayText: 'Entwurf',
+                identifier: 'draft'
+            }, {
+                displayText: 'Gesendet',
+                identifier: 'sent'
+            }, {
+                displayText: 'Angenommen',
+                identifier: 'accepted'
+            }, {
+                displayText: 'Abgelehnt',
+                identifier: 'rejected'
+            }, {
+                displayText: 'Storniert',
+                identifier: 'cancelled'
+            }, {
+                displayText: 'Angeboten',
+                identifier: 'offered'
+            }, {
+                displayText: 'Beauftragt',
+                identifier: 'ordered'
+            }, {
+                displayText: 'Offen',
+                identifier: 'open'
+            }, {
+                displayText: 'Packen',
+                identifier: 'picking'
+            }, {
+                displayText: 'Geliefert',
+                identifier: 'delivered'
+            }, {
+                displayText: 'Zurückerhalten',
+                identifier: 'returned'
+            }, {
+                displayText: 'Abgeschlossen',
+                identifier: 'finished'
+            }, {
+                displayText: 'Verrechnet',
+                identifier: 'applied'
+            }, {
+                displayText: 'Bezahlt',
+                identifier: 'fullypaid'
+            }, {
+                displayText: 'Teilgezahlt',
+                identifier: 'partiallypaid'
+            }, {
+                displayText: 'Gemahnt',
+                identifier: 'reminding'
+            }, {
+                displayText: 'Fällig',
+                identifier: 'overdue'
+            }],
+            fields: [{
+                name: 'displayText'
+            }, {
+                name: 'identifier'
+            }]
+        }, a))
+    }
+}, 1, 0, 0, 0, 0, 0, [EventWorx.store.lookups, 'JobStatus'], 0);
+Ext.cmd.derive('EventWorx.store.lookups.JobStatusMap', Ext.data.Store, {
+    constructor: function(a) {
+        var b = this;
+        a = a || {};
+        Ext.data.Store.prototype.constructor.call(this, Ext.apply({
+            storeId: 'lookups.JobStatusMap',
+            sortOnLoad: !1,
+            trackRemoved: !1,
+            clearOnPageLoad: !1,
+            clearRemovedOnLoad: !1,
+            data: [{
+                identifier: 'draft',
+                relevants: 'request,offer,order,deliverynote,invoice,bill,purchase'
+            }, {
+                identifier: 'planning',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'returning',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'checkout',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'sent',
+                relevants: 'offer,order,purchase,request'
+            }, {
+                identifier: 'accepted',
+                relevants: 'request,offer'
+            }, {
+                identifier: 'rejected',
+                relevants: 'offer,invoice,bill,purchase,repair,request'
+            }, {
+                identifier: 'cancelled',
+                relevants: 'order,deliverynote,purchase'
+            }, {
+                identifier: 'open',
+                relevants: 'repair,order,invoice,bill,clearance'
+            }, {
+                identifier: 'offered',
+                relevants: 'purchase,request'
+            }, {
+                identifier: 'ordered',
+                relevants: 'purchase,offer'
+            }, {
+                identifier: 'processing',
+                relevants: 'repair,purchase'
+            }, {
+                identifier: 'picking',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'delivered',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'returned',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'finished',
+                relevants: 'repair,order,purchase,clearance'
+            }, {
+                identifier: 'completed',
+                relevants: 'deliverynote'
+            }, {
+                identifier: 'applied',
+                relevants: 'invoice,bill'
+            }, {
+                identifier: 'fullypaid',
+                relevants: 'invoice,bill'
+            }, {
+                identifier: 'partiallypaid',
+                relevants: 'invoice,bill'
+            }, {
+                identifier: 'blockpayment',
+                relevants: 'bill'
+            }, {
+                identifier: 'approved',
+                relevants: 'bill'
+            }, {
+                identifier: 'debiting',
+                relevants: 'bill'
+            }],
+            fields: [{
+                description: 'internal identifier, not printable. see EwLocales.lookup',
+                name: 'identifier'
+            }, {
+                description: 'String of all doctypes which this status is relevant for',
+                name: 'relevants'
+            }]
+        }, a))
+    }
+
+
+
+
+
+items: [{
+                    xtype: 'container',
+                    maxWidth: 275,
+                    width: 275,
+                    items: [{
+                        xtype: 'combobox',
+                        margin: '0 15 0 0',
+                        width: 265,
+                        fieldLabel: 'Status Anlieferung',
+                        labelAlign: 'top',
+                        displayTpl: ['<tpl for="."> ', '<tpl if="field1===\'not_planned\'">Ungeplant</tpl>', '<tpl if="field1===\'open\'">Offen</tpl>', '<tpl if="field1===\'requested\'">Angefragt</tpl>', '<tpl if="field1===\'ackknowledged\'">Bestätigt</tpl>', '</tpl>'],
+                        store: ['not_planned', 'open', 'requested', 'ackknowledged'],
+                        bind: {
+                            hidden: '{isNoDelivery}',
+                            value: '{theJob.deliveryPlanningStatus}'
+                        },
+                        listConfig: {
+                            xtype: 'boundlist',
+                            itemSelector: 'div',
+                            itemTpl: ['<tpl for="."> ', '<tpl if="field1===\'not_planned\'">Ungeplant</tpl>', '<tpl if="field1===\'open\'">Offen</tpl>', '<tpl if="field1===\'requested\'">Angefragt</tpl>', '<tpl if="field1===\'ackknowledged\'">Bestätigt</tpl>', '</tpl>']
+                        }
+                    }]
+                }, {
+                    xtype: 'combobox',
+                    margin: '0 0 0 20',
+                    width: 265,
+                    fieldLabel: 'Status Abholung',
+                    labelAlign: 'top',
+                    displayTpl: ['<tpl for="."> ', '<tpl if="field1===\'not_planned\'">Ungeplant</tpl>', '<tpl if="field1===\'open\'">Offen</tpl>', '<tpl if="field1===\'requested\'">Angefragt</tpl>', '<tpl if="field1===\'ackknowledged\'">Bestätigt</tpl>', '</tpl>'],
+                    store: ['not_planned', 'open', 'requested', 'ackknowledged'],
+                    bind: {
+                        hidden: '{isNoReturn}',
+                        value: '{theJob.returnPlanningStatus}'
+                    },
+                    listConfig: {
+                        xtype: 'boundlist',
+                        itemSelector: 'div',
+                        itemTpl: ['<tpl for="."> ', '<tpl if="field1===\'not_planned\'">Ungeplant</tpl>', '<tpl if="field1===\'open\'">Offen</tpl>', '<tpl if="field1===\'requested\'">Angefragt</tpl>', '<tpl if="field1===\'ackknowledged\'">Bestätigt</tpl>', '</tpl>']
+                    }
+                }]
+
+

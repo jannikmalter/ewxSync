@@ -21,11 +21,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Local cache & raw API dumps
-local_*.json
-all_eventworx_raw.json
-sync_state.json
-ewx_api_test_response.json
+# Local cache: debug snapshots, raw API dumps, locale pulls, large JS bundles
+cache/
 
 # Credentials
 .env

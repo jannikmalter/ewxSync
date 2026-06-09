@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from dataclasses import dataclass, asdict
-import time, json, logging, requests, sys, os, re, signal
+import time, json, logging, requests, os, re, signal
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from notion_client import Client
@@ -18,8 +18,11 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID  = os.getenv("DATABASE_ID")   
 
 EVENTWORX_BASE = os.getenv("EVENTWORX_BASE")
-LOCAL_PROJECTS_CACHE = "local_eventworx_projects.json"
-LOCAL_DOCS_CACHE = "local_eventworx_docs.json"
+
+# All on-disk snapshots are DEBUG-only and live under cache/ next to this script.
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+LOCAL_PROJECTS_CACHE = os.path.join(CACHE_DIR, "local_eventworx_projects.json")
+LOCAL_DOCS_CACHE = os.path.join(CACHE_DIR, "local_eventworx_docs.json")
 
 USERNAME = os.getenv("EVENTWORX_USERNAME")
 PASSWORD = os.getenv("EVENTWORX_PASSWORD")
@@ -30,17 +33,19 @@ DISCORD_VERMIETUNGEN_CHANNEL_ID = os.getenv("DISCORD_VERMIETUNGEN_CHANNEL_ID")
 DISCORD_JOBS_CATEGORY_ID = os.getenv("DISCORD_JOBS_CATEGORY_ID")
 DISCORD_CREW_ROLE_ID = os.getenv("DISCORD_CREW_ROLE_ID")
 DISCORD_API_BASE = "https://discord.com/api/v10"
-DISCORD_CACHE    = "local_discord_channels.json"
-DISCORD_THREADS_CACHE = "local_discord_threads.json"
+DISCORD_CACHE    = os.path.join(CACHE_DIR, "local_discord_channels.json")
+DISCORD_THREADS_CACHE = os.path.join(CACHE_DIR, "local_discord_threads.json")
 
 # Daemon configuration
 POLL_INTERVAL_SECONDS = 60          # how often to probe Eventworx for changes
 FULL_SYNC_INTERVAL_SECONDS = 86400  # run an unconditional full sync at least this often (daily)
-SYNC_STATE_FILE = "sync_state.json"
+SYNC_STATE_FILE = os.path.join(CACHE_DIR, "sync_state.json")
 
 # Debug mode writes all local caches to disk for inspection. In normal operation
 # the daemon runs purely in memory — every restart triggers a full sync.
 DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
+if DEBUG:
+    os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Kill-switch for the Discord "has been created" announcements. When off, no
 # per-document messages are posted and new threads fall back to a plain crew ping.
@@ -66,6 +71,22 @@ COMMON_HEADERS = {
     "Origin": EVENTWORX_BASE,
     "Referer": f"{EVENTWORX_BASE}/eventworx/",
 }
+
+# (connect, read) timeout for every EWX and Discord HTTP call. requests defaults
+# to waiting forever, so a single stalled connection would hang the daemon
+# permanently with no exception or log line.
+HTTP_TIMEOUT = (10, 60)
+
+class TimeoutSession(requests.Session):
+    """requests.Session that applies HTTP_TIMEOUT unless a call passes its own."""
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", HTTP_TIMEOUT)
+        return super().request(*args, **kwargs)
+
+# Shared session for all Discord calls — enforces HTTP_TIMEOUT and reuses
+# connections instead of opening a fresh one per request. (Notion calls go
+# through notion-client, which has its own 60s default timeout.)
+_http = TimeoutSession()
 
 # Status sets derived from Eventworx's own UI filter requests for "active orders/offers".
 # Offers include "accepted" as an active state; orders do not.
@@ -93,6 +114,64 @@ EWX_DOC_TYPE_LABELS = {
     "deliverynote": "Deliverynote",
     "invoice": "Invoice",
 }
+
+# Per-docType map from raw Eventworx status codes to the human-readable English label
+# used in Discord status-change announcements. The raw codes are terse and the SAME code
+# renders differently per docType (an order's `sent` is "Bestätigt"/confirmed, an offer's
+# `sent` is "Gesendet"/sent), so the mapping is scoped by docType.
+#
+# Authoritative source: the locale table the EWX frontend loads at runtime —
+# `Common.JobStatusMap.<docType>.<status>` in <base>/eventworx/resources/locales/de.json.
+# Pull a fresh copy with helpers/fetch_locales.py. This instance is German-only
+# (en.json -> 404), so the English below is our translation of the German UI labels (given
+# in the per-docType comments). The API exposes no display label, so the mapping lives in
+# code; any docType/status not in the table falls back to the raw code (see status_label).
+# Full per-docType tree and gotchas: eventworx API analysis.md.
+STATUS_LABELS: dict[str, dict[str, str]] = {
+    "order": {  # draft=Entwurf, sent=Bestätigt, open=Offen, finished=Abgeschlossen, cancelled=Storniert
+        "draft": "draft", "sent": "confirmed", "open": "open",
+        "finished": "completed", "cancelled": "cancelled",
+    },
+    "offer": {  # draft=Entwurf, sent=Gesendet, accepted=Angenommen, open=Offen, ordered=Beauftragt, rejected=Abgelehnt
+        "draft": "draft", "sent": "sent", "accepted": "accepted",
+        "open": "open", "ordered": "ordered", "rejected": "rejected",
+    },
+    "request": {  # draft=Entwurf, sent=Gesendet, offered=Angeboten, accepted=Bestätigt, rejected=Abgelehnt
+        "draft": "draft", "sent": "sent", "offered": "offered",
+        "accepted": "confirmed", "rejected": "rejected",
+    },
+    "deliverynote": {  # planning=Entwurf, checkout/picking=Packen, returning=Im Wareneingang,
+                       # returned/finished=Ware zurück, completed=Abgeschlossen, open=In Bearbeitung
+        "draft": "draft", "planning": "draft", "checkout": "packing", "picking": "packing",
+        "picked": "packed", "delivered": "delivered", "arrived": "arrived", "open": "in progress",
+        "returning": "receiving", "returned": "returned", "finished": "returned",
+        "partialreturn": "partially returned", "completed": "completed", "overdue": "overdue",
+        "cancelled": "cancelled", "rejected": "cancelled",
+    },
+    "invoice": {  # applied=Verrechnet, partiallypaid=Teilzahlung, fullypaid=Bezahlt,
+                  # rejected=Storniert, reminding=Gemahnt, overdue=Überfällig
+        "draft": "draft", "open": "open", "applied": "offset",
+        "partiallypaid": "partially paid", "fullypaid": "paid",
+        "rejected": "cancelled", "overdue": "overdue", "reminding": "reminded",
+    },
+    # Not produced by this daemon's projects; kept for fallback safety / completeness.
+    "clearance": {  # open=In Klärung, rejected=Storniert, finished=Abgeschlossen
+        "open": "under review", "rejected": "cancelled", "finished": "completed",
+    },
+    "repair": {  # open=Offen, processing=In Arbeit, rejected=Storniert, finished=Abgeschlossen
+        "open": "open", "processing": "in progress", "rejected": "cancelled", "finished": "completed",
+    },
+}
+
+
+def status_label(doc_type: str, status: str) -> str:
+    """Human-readable English label for a raw Eventworx status, scoped by docType.
+
+    Eventworx returns terse internal codes whose meaning varies by docType (an
+    order's "sent" means confirmed; an offer's "sent" means sent). Falls back to
+    the raw code for any docType/status not covered by STATUS_LABELS.
+    """
+    return STATUS_LABELS.get(doc_type, {}).get(status, status)
 
 
 # --------------- DATA MODELS ---------------
@@ -235,10 +314,11 @@ def format_doc_created_line(d: Document) -> str:
 def format_doc_status_changed_line(d: Document) -> str:
     """One-line Discord announcement for a document whose status changed.
 
-    e.g. "Order [AU-1234](<url>) changed its status to finished!". The status is
-    the raw Eventworx value (finished, cancelled, ordered, fullypaid, …).
+    e.g. "Order [AU-1234](<url>) changed its status to confirmed!". The raw
+    Eventworx status code is translated to a friendly per-docType English label
+    via status_label (an order's raw "sent" reads as "confirmed").
     """
-    return f"{_doc_label_and_link(d)} changed its status to {d.status}!"
+    return f"{_doc_label_and_link(d)} changed its status to {status_label(d.docType, d.status)}!"
 
 def _first_non_null(docs: list[Document], attr: str):
     """Return the first non-null value for attr, preferring the most recently modified doc."""
@@ -388,22 +468,34 @@ def _log_http(label: str, resp: requests.Response):
 
 
 def try_login(username, password):
+    """Log in to Eventworx and return (session, token).
+
+    Raises on any failure so the daemon's tick handler retries next tick —
+    never exits the process. If the READONLY license is still held (e.g. our
+    own previous session after a hard crash that skipped logout), one retry
+    with forceLogoff reclaims it.
+    """
     logging.info("Logging in…")
-    s = requests.Session()
-    payload = {"license": "READONLY", "forceLogoff": "false",
-               "username": username, "password": password}
+    s = TimeoutSession()
     headers = {**COMMON_HEADERS,
                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"}
-    r = s.post(f"{EVENTWORX_BASE}/backend/login", data=payload, headers=headers)
-    if "LICENSE-NOT-AVAILABLE" in r.text:
-        logging.error("License already in use.")
-        sys.exit(1)
-    token = r.headers.get("x-auth-token")
-    if not token:
-        logging.error("No auth token received.")
-        sys.exit(1)
-    logging.info("Logged in.")
-    return s, token
+    for force_logoff in ("false", "true"):
+        payload = {"license": "READONLY", "forceLogoff": force_logoff,
+                   "username": username, "password": password}
+        r = s.post(f"{EVENTWORX_BASE}/backend/login", data=payload, headers=headers)
+        if "LICENSE-NOT-AVAILABLE" in r.text:
+            if force_logoff == "false":
+                logging.warning("READONLY license already in use — retrying with forceLogoff "
+                                "to reclaim a possibly-stale session.")
+                continue
+            raise RuntimeError("Eventworx READONLY license not available even with forceLogoff.")
+        r.raise_for_status()
+        token = r.headers.get("x-auth-token")
+        if not token:
+            raise RuntimeError(f"Eventworx login returned no auth token (HTTP {r.status_code}).")
+        logging.info("Logged in.")
+        return s, token
+    raise RuntimeError("Eventworx login failed.")  # unreachable, keeps the type checker happy
 
 def logout(session, token):
     headers = {**COMMON_HEADERS,
@@ -485,7 +577,7 @@ def fetch_all_docs(session, token, category_map: dict) -> list[Document]:
         start += limit
 
     if DEBUG:
-        with open("all_eventworx_raw.json", "w", encoding="utf-8") as f:
+        with open(os.path.join(CACHE_DIR, "all_eventworx_raw.json"), "w", encoding="utf-8") as f:
             json.dump(all_raw, f, ensure_ascii=False, indent=2)
 
     return docs
@@ -792,7 +884,7 @@ def save_notion_local_dict(existing: dict):
     serializable = [{"page_id": e["page_id"],
                      "last_edited_time": e.get("last_edited_time"),
                      "obj": asdict(e["obj"])} for e in existing.values()]
-    with open("local_notion_projects.json", "w", encoding="utf-8") as f:
+    with open(os.path.join(CACHE_DIR, "local_notion_projects.json"), "w", encoding="utf-8") as f:
         json.dump(serializable, f, ensure_ascii=False, indent=2)
 
 
@@ -800,7 +892,7 @@ def save_notion_local_dict(existing: dict):
 def fetch_discord_channels() -> list[DiscordChannel]:
     logging.info("Fetching Discord channels…")
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-    r = requests.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/channels", headers=headers)
+    r = _http.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/channels", headers=headers)
     r.raise_for_status()
     channels = []
     for ch in r.json():
@@ -853,7 +945,7 @@ def build_discord_topic(old_topic: str | None, project_number: str,
 def update_discord_topic(channel_id: str, new_topic: str):
     headers = {"Authorization": f"Bot {DISCORD_TOKEN}",
                "Content-Type": "application/json"}
-    r = requests.patch(f"{DISCORD_API_BASE}/channels/{channel_id}",
+    r = _http.patch(f"{DISCORD_API_BASE}/channels/{channel_id}",
                        headers=headers, json={"topic": new_topic})
     r.raise_for_status()
 
@@ -878,7 +970,7 @@ def _parse_thread(raw: dict) -> DiscordThread | None:
 
 def fetch_active_threads(channel_id: str) -> list[DiscordThread]:
     """Return non-archived threads in the given channel whose name starts with P-XXXX_."""
-    r = requests.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/threads/active",
+    r = _http.get(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/threads/active",
                      headers=_discord_headers())
     r.raise_for_status()
     threads = []
@@ -900,7 +992,7 @@ def fetch_archived_threads(channel_id: str) -> list[DiscordThread]:
         params = {"limit": 100}
         if before:
             params["before"] = before
-        r = requests.get(f"{DISCORD_API_BASE}/channels/{channel_id}/threads/archived/public",
+        r = _http.get(f"{DISCORD_API_BASE}/channels/{channel_id}/threads/archived/public",
                          headers=headers, params=params)
         r.raise_for_status()
         body = r.json()
@@ -938,7 +1030,7 @@ def create_thread(channel_id: str, name: str) -> DiscordThread | None:
         "type": 11,  # PUBLIC_THREAD
         "auto_archive_duration": THREAD_AUTO_ARCHIVE_MINUTES,
     }
-    r = requests.post(f"{DISCORD_API_BASE}/channels/{channel_id}/threads",
+    r = _http.post(f"{DISCORD_API_BASE}/channels/{channel_id}/threads",
                       headers=_discord_headers(), json=payload)
     r.raise_for_status()
     return _parse_thread(r.json())
@@ -948,7 +1040,7 @@ def thread_has_crew_ping(thread_id: str) -> bool:
     Checks the 50 oldest messages — our ping (when present) is always the starter."""
     if not DISCORD_CREW_ROLE_ID:
         return True  # nothing to ping; treat as already done
-    r = requests.get(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
+    r = _http.get(f"{DISCORD_API_BASE}/channels/{thread_id}/messages",
                      headers=_discord_headers(),
                      params={"after": "0", "limit": 50})
     r.raise_for_status()
@@ -962,7 +1054,7 @@ def post_discord_message(channel_id: str, content: str,
     payload: dict = {"content": content}
     if allowed_mentions is not None:
         payload["allowed_mentions"] = allowed_mentions
-    r = requests.post(f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
+    r = _http.post(f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
                       headers=_discord_headers(), json=payload)
     r.raise_for_status()
 
@@ -996,7 +1088,7 @@ def ping_crew_in_thread(thread_id: str,
     post_discord_message(thread_id, "\n".join(lines), allowed)
 
 def archive_thread(thread_id: str):
-    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+    r = _http.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
                        headers=_discord_headers(), json={"archived": True})
     r.raise_for_status()
 
@@ -1005,12 +1097,12 @@ def unarchive_thread(thread_id: str, name: str | None = None):
     payload: dict = {"archived": False}
     if name is not None:
         payload["name"] = name
-    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+    r = _http.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
                        headers=_discord_headers(), json=payload)
     r.raise_for_status()
 
 def rename_thread(thread_id: str, name: str):
-    r = requests.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
+    r = _http.patch(f"{DISCORD_API_BASE}/channels/{thread_id}",
                        headers=_discord_headers(), json={"name": name})
     r.raise_for_status()
 
@@ -1040,7 +1132,7 @@ def build_channel_name(p: ProjectSummary) -> str:
 def create_discord_channel(name: str, topic: str, parent_id: str) -> DiscordChannel | None:
     """Create a text channel under parent_id with a pre-populated topic."""
     payload = {"name": name, "type": 0, "topic": topic, "parent_id": parent_id}
-    r = requests.post(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/channels",
+    r = _http.post(f"{DISCORD_API_BASE}/guilds/{DISCORD_GUILD_ID}/channels",
                       headers=_discord_headers(), json=payload)
     r.raise_for_status()
     raw = r.json()
@@ -1576,10 +1668,14 @@ def full_sync(session, token, state: SyncState) -> int:
     """
     logging.info("Full sync starting.")
 
+    # Checkpoint BEFORE fetching: docs modified while the paginated fetch runs
+    # must be re-probed by the next incremental tick, not lost until the next
+    # daily full sync. Re-processing the overlap is idempotent.
+    now_ms = int(time.time() * 1000)
+
     state.category_map = fetch_job_categories(session, token)
     all_docs = fetch_all_docs(session, token, state.category_map)
     state.docs_by_pn = {}
-    now_ms = int(time.time() * 1000)
     for pn, docs in group_docs_by_project(all_docs).items():
         state.docs_by_pn[pn] = {_doc_key(d): d for d in docs}
     state.projects = {pn: aggregate_one_project(pn, list(d.values()), now_ms)

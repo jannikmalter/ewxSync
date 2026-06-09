@@ -23,7 +23,8 @@ COMMON_HEADERS = {
     "Referer": f"{EVENTWORX_BASE}/eventworx/",
 }
 
-OUTPUT_FILE = "ewx_api_test_response.json"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
+OUTPUT_FILE = os.path.join(CACHE_DIR, "ewx_api_test_response.json")
 
 # -------- REQUEST TO TEST --------
 # Tweak this dict to point at any backend endpoint.
@@ -136,6 +137,7 @@ def main():
     session, token = try_login(USERNAME, PASSWORD)
     try:
         result = run_request(session, token, REQUEST)
+        os.makedirs(CACHE_DIR, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(result, f, indent=2, ensure_ascii=False)
         logging.info("Wrote %s", OUTPUT_FILE)

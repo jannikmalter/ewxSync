@@ -27,7 +27,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("DISCORD_GUILD_ID"))
-MAPPING_FILE = "local_discord_eventworx_mapping.json"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "cache")
+MAPPING_FILE = os.path.join(CACHE_DIR, "local_discord_eventworx_mapping.json")
 
 # --- Safety switches -----------------------------------------------------
 # Set to a channel id (int) to limit changes to a single channel for testing.
