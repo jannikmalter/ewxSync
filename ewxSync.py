@@ -46,6 +46,10 @@ DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
 # per-document messages are posted and new threads fall back to a plain crew ping.
 ANNOUNCE_NEW_DOCS = os.getenv("ANNOUNCE_NEW_DOCS", "true").lower() in ("1", "true", "yes", "on")
 
+# Kill-switch for the Discord "changed its status to X" announcements. Independent
+# of ANNOUNCE_NEW_DOCS — status-change messages are a separate event class.
+ANNOUNCE_STATUS_CHANGES = os.getenv("ANNOUNCE_STATUS_CHANGES", "true").lower() in ("1", "true", "yes", "on")
+
 # Thread names start with the project number so we can join threads to projects
 # without persisting any IDs: e.g. "P-1234_Sommerfest Müller".
 THREAD_NAME_MAX = 100  # Discord channel/thread name limit
@@ -208,16 +212,33 @@ def eventworx_doc_url(doc_type: str, doc_id: str) -> str | None:
         return None
     return f"{EVENTWORX_BASE}/eventworx/#job/edit/{doc_type}/{doc_id}"
 
-def format_doc_created_line(d: Document) -> str:
-    """One-line Discord announcement for a newly created document.
+def _doc_label_and_link(d: Document) -> str:
+    """'Order [AU-1234](<url>)' — human-readable type label plus the EWX deep-link.
 
-    e.g. "Order [AU-1234](<url>) has been created!". The URL is angle-bracketed
-    to suppress Discord's link embed, matching the crew-ping style.
+    The URL is angle-bracketed to suppress Discord's link embed, matching the
+    crew-ping style. Falls back to the bare job number when no URL can be built.
     """
     label = EWX_DOC_TYPE_LABELS.get(d.docType, d.docType.capitalize() or "Document")
     url = eventworx_doc_url(d.docType, d.docId)
     link = f"[{d.jobNumber}](<{url}>)" if url else d.jobNumber
-    return f"{label} {link} has been created!"
+    return f"{label} {link}"
+
+
+def format_doc_created_line(d: Document) -> str:
+    """One-line Discord announcement for a newly created document.
+
+    e.g. "Order [AU-1234](<url>) has been created!".
+    """
+    return f"{_doc_label_and_link(d)} has been created!"
+
+
+def format_doc_status_changed_line(d: Document) -> str:
+    """One-line Discord announcement for a document whose status changed.
+
+    e.g. "Order [AU-1234](<url>) changed its status to finished!". The status is
+    the raw Eventworx value (finished, cancelled, ordered, fullypaid, …).
+    """
+    return f"{_doc_label_and_link(d)} changed its status to {d.status}!"
 
 def _first_non_null(docs: list[Document], attr: str):
     """Return the first non-null value for attr, preferring the most recently modified doc."""
@@ -1416,17 +1437,23 @@ def push_projects(pns: list[str], state: SyncState):
                  discord_unchanged, discord_skipped)
 
 
-def apply_changed_docs(state: SyncState, changed: list[Document]) -> tuple[set[str], list[Document]]:
+def apply_changed_docs(state: SyncState, changed: list[Document]) -> tuple[set[str], list[Document], list[Document]]:
     """Merge changed docs into state.docs_by_pn and re-aggregate affected projects.
 
-    Returns `(affected, new_docs)`: the set of affected projectNumbers so the caller
-    can push them, and the docs that did not previously exist in the in-memory mirror
-    (a docId we hadn't seen) so the caller can announce them. A doc whose projectNumber
-    is empty is skipped — Eventworx returns such rows for unassigned drafts and they
-    don't belong to any aggregate.
+    Returns `(affected, new_docs, status_changes)`:
+    - `affected` — projectNumbers to push.
+    - `new_docs` — docs whose docId we hadn't seen before this tick (a creation).
+    - `status_changes` — previously-seen docs whose `status` field differs from the
+      mirrored value (a transition, e.g. order open→finished). The returned Document
+      carries the *new* status. Creations are never in this list; a doc is either new
+      or a potential status change, never both.
+
+    A doc whose projectNumber is empty is skipped — Eventworx returns such rows for
+    unassigned drafts and they don't belong to any aggregate.
     """
     affected: set[str] = set()
     new_docs: list[Document] = []
+    status_changes: list[Document] = []
     for d in changed:
         if not d.projectNumber:
             continue
@@ -1434,13 +1461,15 @@ def apply_changed_docs(state: SyncState, changed: list[Document]) -> tuple[set[s
         key = _doc_key(d)
         if key not in bucket:
             new_docs.append(d)
+        elif d.status and d.status != bucket[key].status:
+            status_changes.append(d)
         bucket[key] = d
         affected.add(d.projectNumber)
     now_ms = int(time.time() * 1000)
     for pn in affected:
         docs = list(state.docs_by_pn[pn].values())
         state.projects[pn] = aggregate_one_project(pn, docs, now_ms)
-    return affected, new_docs
+    return affected, new_docs, status_changes
 
 
 def discord_destination(pn: str, p: ProjectSummary, state: SyncState) -> str | None:
@@ -1487,6 +1516,38 @@ def announce_new_docs(new_docs: list[Document], state: SyncState, announced_pns:
         sent += 1
     if new_docs:
         logging.info("Announcements: %d %s, %d skipped (no destination).",
+                     sent, "would-send" if DEBUG else "sent", skipped)
+
+
+def announce_status_changes(status_changes: list[Document], state: SyncState):
+    """Post a "<Type> <job> changed its status to X!" message per status transition.
+
+    Mirrors announce_new_docs' routing: Technikmiete projects → their vermietungen
+    thread, everything else → the job channel. Docs whose project has no Discord
+    destination yet are silently skipped. Unlike creations, status changes are never
+    folded into a new thread's intro, so there is no announced_pns skip set here.
+    """
+    sent = skipped = 0
+    for d in status_changes:
+        pn = d.projectNumber
+        p = state.projects.get(pn)
+        if p is None:
+            skipped += 1
+            continue
+        dest = discord_destination(pn, p, state)
+        if not dest:
+            skipped += 1
+            continue
+        line = format_doc_status_changed_line(d)
+        if DEBUG:
+            logging.info("[DRY-RUN] Would announce in %s: %s", pn, line)
+            sent += 1
+            continue
+        post_discord_message(dest, line)
+        logging.info("Announced in %s: %s", pn, line)
+        sent += 1
+    if status_changes:
+        logging.info("Status announcements: %d %s, %d skipped (no destination).",
                      sent, "would-send" if DEBUG else "sent", skipped)
 
 
@@ -1558,16 +1619,18 @@ def incremental_sync(session, token, state: SyncState,
     tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()
 
     changed_docs = fetch_changed_docs(session, token, last_ewx_check_ms, state.category_map)
-    affected, new_docs = apply_changed_docs(state, changed_docs)
+    affected, new_docs, status_changes = apply_changed_docs(state, changed_docs)
     # When announcements are disabled, drop the new-doc list so nothing is posted
     # and new threads fall back to a plain crew ping (empty new_docs_by_pn).
     if not ANNOUNCE_NEW_DOCS:
         new_docs = []
+    if not ANNOUNCE_STATUS_CHANGES:
+        status_changes = []
     new_docs_by_pn: dict[str, list[Document]] = {}
     for d in new_docs:
         new_docs_by_pn.setdefault(d.projectNumber, []).append(d)
-    logging.info("EWX probe: %d changed doc(s) (%d new) → %d affected project(s).",
-                 len(changed_docs), len(new_docs), len(affected))
+    logging.info("EWX probe: %d changed doc(s) (%d new, %d status change(s)) → %d affected project(s).",
+                 len(changed_docs), len(new_docs), len(status_changes), len(affected))
 
     if last_notion_check_iso is not None:
         changed_pages = fetch_changed_notion_pages(state.data_source_id, last_notion_check_iso)
@@ -1588,6 +1651,7 @@ def incremental_sync(session, token, state: SyncState,
     sync_job_channels(list(state.projects.values()), state.discord_by_pn)
     announced = sync_vermietungen_threads(list(state.projects.values()), state, new_docs_by_pn)
     announce_new_docs(new_docs, state, announced)
+    announce_status_changes(status_changes, state)
 
     save_state_to_disk(state)
     return tick_ms, tick_iso
@@ -1630,8 +1694,8 @@ def main():
     data_source_id = resolve_notion_data_source_id()
     state = new_empty_state(data_source_id)
 
-    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds, debug=%s, announce_new_docs=%s.",
-                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS, DEBUG, ANNOUNCE_NEW_DOCS)
+    logging.info("ewxSync daemon starting. poll=%ds, full_sync_interval=%ds, debug=%s, announce_new_docs=%s, announce_status_changes=%s.",
+                 POLL_INTERVAL_SECONDS, FULL_SYNC_INTERVAL_SECONDS, DEBUG, ANNOUNCE_NEW_DOCS, ANNOUNCE_STATUS_CHANGES)
 
     session = auth_token = None
     first_tick = True

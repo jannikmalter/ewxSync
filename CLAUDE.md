@@ -45,6 +45,7 @@ No build step, test runner, or linter is configured.
 | `DISCORD_JOBS_CATEGORY_ID` | Category under which non-Technikmiete project channels are created. Required for `sync_job_channels`. |
 | `DISCORD_CREW_ROLE_ID` | Role to mention when a vermietungen thread is created, so its members auto-subscribe to the thread. Optional — when unset, the crew ping is skipped. |
 | `ANNOUNCE_NEW_DOCS` | `true`/`1`/`yes`/`on` (default `true`) enables the Discord "`<Type> <job>` has been created!" messages. Set to `false`/`0`/`no`/`off` to kill the feature: no per-document messages are posted and new threads fall back to a plain crew ping. Optional. |
+| `ANNOUNCE_STATUS_CHANGES` | `true`/`1`/`yes`/`on` (default `true`) enables the Discord "`<Type> <job>` changed its status to `<status>`!" messages. Set to `false`/`0`/`no`/`off` to kill the feature. Independent of `ANNOUNCE_NEW_DOCS`. Optional. |
 | `DEBUG` | `true`/`1`/`yes`/`on` puts the daemon in dry-run / observation mode: every external write (Notion page create/update, Discord channel create, channel topic update, thread create/rename/archive/unarchive, crew ping) is logged with a `[DRY-RUN]` prefix instead of called, and a snapshot of in-memory state is written to disk after every tick. Off by default. The daemon never reads from disk in any mode. |
 
 ## Architecture
@@ -63,6 +64,7 @@ No build step, test runner, or linter is configured.
 | `meaningful_diffs()` | Notion-write gate: only diff on fields whose new value is non-empty, so empty EWX data never clears Notion. |
 | `ping_crew_in_thread()` / `thread_has_crew_ping()` | Send the role mention that auto-subscribes Crew members (optionally prefixed with announcement lines); detect whether a thread already received one. |
 | `announce_new_docs()` | Post a "`<Type> <job>` has been created!" message into a project's channel/thread for each newly created EWX document (incremental ticks only). |
+| `announce_status_changes()` | Post a "`<Type> <job>` changed its status to `<status>`!" message for each previously-seen document whose `status` field changed (incremental ticks only). |
 
 ### Sync model
 
@@ -98,7 +100,7 @@ One Eventworx login at startup is reused across ticks; the session is only re-es
 1. **EWX probe** — `fetch_changed_docs(session, token, last_ewx_check_ms)` paginates `/backend/job` with `filter=lastModification|* > last_ewx_check_ms`. Each returned doc replaces its entry in `state.docs_by_pn[pn][doc_key]` (or is inserted if new). The set of affected `projectNumber`s drives re-aggregation via `aggregate_one_project()`.
 2. **Notion probe** — `fetch_changed_notion_pages(data_source_id, last_notion_check_iso)` uses Notion's `last_edited_time` `on_or_after` filter. Returned pages overwrite `state.notion_entries[pn]` verbatim — the in-memory mirror always matches Notion. Self-edits re-appear here on the next tick; that's expected (it keeps the mirror correct) and they yield no diff against the EWX-derived desired state, so no push loop occurs.
 
-After probes, the union of affected projects is pushed via `push_projects()`. Each project: `push_project_to_notion()` diffs against the in-memory mirror via `meaningful_diffs` and writes on divergence (mirror then refreshed from the API response so it stays perfectly aligned with Notion); `push_project_to_discord_topic()` diffs the topic and PATCHes the channel if EWX or Notion URLs changed. `sync_job_channels()` and `sync_vermietungen_threads()` run only when at least one project was affected. Finally `announce_new_docs()` posts a "has been created" message for each newly created document (see [Document-created announcements](#document-created-announcements)).
+After probes, the union of affected projects is pushed via `push_projects()`. Each project: `push_project_to_notion()` diffs against the in-memory mirror via `meaningful_diffs` and writes on divergence (mirror then refreshed from the API response so it stays perfectly aligned with Notion); `push_project_to_discord_topic()` diffs the topic and PATCHes the channel if EWX or Notion URLs changed. `sync_job_channels()` and `sync_vermietungen_threads()` run only when at least one project was affected. Finally `announce_new_docs()` posts a "has been created" message for each newly created document (see [Document-created announcements](#document-created-announcements)) and `announce_status_changes()` posts a "changed its status to X" message for each document whose status changed (see [Document status-change announcements](#document-status-change-announcements)).
 
 Each tick:
 1. **Capture timestamps before any fetch.** `tick_ms = int(time.time() * 1000)` and `tick_iso = datetime.fromtimestamp(tick_ms / 1000.0, tz=timezone.utc).isoformat()` are the candidate checkpoints. Captured first so anything modified during the tick is re-probed on the next pass.
@@ -131,12 +133,13 @@ Shutdown: `SIGINT`/`SIGTERM` set `_stop = True`. `_interruptible_sleep()` polls 
 
   ELSE:
     incremental_sync(session, token, state, last_ewx_check, last_notion_check):
-      fetch_changed_docs        → apply_changed_docs   → affected EWX PNs + new docs
+      fetch_changed_docs        → apply_changed_docs   → affected EWX PNs + new docs + status changes
       fetch_changed_notion_pages → apply_changed_notion → affected Notion PNs
       IF affected: push_projects(affected) → per-project Notion + Discord topic
                    sync_job_channels (full list)
                    sync_vermietungen_threads (full list) → folds new-doc lines into new threads
                    announce_new_docs(new docs) → "has been created" per new doc
+                   announce_status_changes(status changes) → "changed its status to X" per change
                    save_state_to_disk    (no-op unless DEBUG=true)
 
   advance last_ewx_check_ms = tick_ms, last_notion_check_iso = tick_iso
@@ -247,6 +250,16 @@ Existing threads without a crew ping are backfilled in a final pass over the tar
 - **At-most-once**: the new-doc list is derived in memory and never persisted. If a tick fails after the doc is merged but before the announce pass, the doc is already in the mirror next tick and won't re-announce. Acceptable for notifications.
 - **DEBUG**: each would-be message logs `[DRY-RUN] Would announce …`; summary line `Announcements: N sent, M skipped (no destination).` (verb becomes `would-send`).
 - **Kill-switch**: `ANNOUNCE_NEW_DOCS=false` disables the whole feature — `incremental_sync()` clears the new-doc list, so nothing is posted and new threads fall back to a plain crew ping.
+
+### Document status-change announcements
+
+`announce_status_changes()` posts a one-line message into a project's Discord destination whenever an **existing** EWX document's `status` field changes: `Order [AU-1234](<url>) changed its status to finished!`. The status is the **raw Eventworx value** (`finished`, `cancelled`, `ordered`, `accepted`, `fullypaid`, …) — no friendly relabeling. Same link/routing/skip semantics as document-created announcements. Differences from that feature:
+
+- **What counts as a "status change"**: `apply_changed_docs()` compares each changed doc's `status` against the mirrored value *before* overwriting it. A doc is in `status_changes` when its `_doc_key` already existed and the new `status` is non-empty and differs. Creations are never status changes (a doc is either new or a possible status change, never both). Sub-status fields (`deliveryStatus`, `invoiceStatus`) are **not** tracked — only the main `status`.
+- **All transitions announced**: every status change for every docType is posted (no curated subset). Observed `status` values per docType are catalogued in [eventworx API analysis.md](eventworx%20API%20analysis.md).
+- **Not folded into thread intros**: unlike creations, status changes are never merged into a freshly created thread's intro message — they always post as their own message, so there is no `announced_pns` skip set.
+- **Incremental only / at-most-once / DEBUG**: identical to document-created announcements. Summary line: `Status announcements: N sent, M skipped (no destination).`
+- **Kill-switch**: `ANNOUNCE_STATUS_CHANGES=false` disables the feature independently of `ANNOUNCE_NEW_DOCS`.
 
 ### Logging convention
 
