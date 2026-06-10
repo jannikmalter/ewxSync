@@ -1050,8 +1050,12 @@ def thread_has_crew_ping(thread_id: str) -> bool:
 
 def post_discord_message(channel_id: str, content: str,
                          allowed_mentions: dict | None = None):
-    """Post a plain message to a channel or thread (same endpoint for both)."""
-    payload: dict = {"content": content}
+    """Post a plain message to a channel or thread (same endpoint for both).
+
+    All messages are sent with the SUPPRESS_NOTIFICATIONS flag (1 << 12) — they post
+    and render normally (mentions still auto-subscribe Crew members to threads) but
+    trigger no push/desktop notification, i.e. the equivalent of Discord's @silent."""
+    payload: dict = {"content": content, "flags": 1 << 12}
     if allowed_mentions is not None:
         payload["allowed_mentions"] = allowed_mentions
     r = _http.post(f"{DISCORD_API_BASE}/channels/{channel_id}/messages",
