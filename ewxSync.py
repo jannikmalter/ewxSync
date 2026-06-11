@@ -47,11 +47,11 @@ DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes", "on")
 if DEBUG:
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Kill-switch for the Discord "has been created" announcements. When off, no
+# Kill-switch for the Discord "wurde erstellt" announcements. When off, no
 # per-document messages are posted and new threads fall back to a plain crew ping.
 ANNOUNCE_NEW_DOCS = os.getenv("ANNOUNCE_NEW_DOCS", "true").lower() in ("1", "true", "yes", "on")
 
-# Kill-switch for the Discord "changed its status to X" announcements. Independent
+# Kill-switch for the Discord status-change announcements. Independent
 # of ANNOUNCE_NEW_DOCS — status-change messages are a separate event class.
 ANNOUNCE_STATUS_CHANGES = os.getenv("ANNOUNCE_STATUS_CHANGES", "true").lower() in ("1", "true", "yes", "on")
 
@@ -106,72 +106,81 @@ ACTIVE_DEAL_TYPES     = {"rent", "sale"}
 # so they only represent a project when nothing more authoritative exists.
 CLOSED_REP_PRIORITY = {"invoice": 4, "order": 3, "offer": 2, "deliverynote": 1}
 
-# Human-readable noun per EWX docType, used in the Discord "has been created" messages.
+# German noun per EWX docType (matching the EWX UI), used in the Discord announcements.
 EWX_DOC_TYPE_LABELS = {
-    "order": "Order",
-    "offer": "Offer",
-    "request": "Request",
-    "deliverynote": "Deliverynote",
-    "invoice": "Invoice",
+    "order": "Auftrag",
+    "offer": "Angebot",
+    "request": "Anfrage",
+    "deliverynote": "Lieferschein",
+    "invoice": "Rechnung",
+    "clearance": "Klärung",
+    "repair": "Reparatur",
 }
 
-# Per-docType map from raw Eventworx status codes to the human-readable English label
-# used in Discord status-change announcements. The raw codes are terse and the SAME code
-# renders differently per docType (an order's `sent` is "Bestätigt"/confirmed, an offer's
-# `sent` is "Gesendet"/sent), so the mapping is scoped by docType.
+# Per-docType map from raw Eventworx status codes to the German predicate phrase used in
+# Discord status-change announcements: "<Typ> <Nummer> <phrase>", e.g. "Auftrag AU-1234
+# ist bestätigt". Each phrase carries its own verb because no single verb fits every
+# status. The raw codes are terse and the SAME code renders differently per docType (an
+# order's `sent` is "Bestätigt", an offer's `sent` is "Gesendet"), so the mapping is
+# scoped by docType.
 #
 # Authoritative source: the locale table the EWX frontend loads at runtime —
-# `Common.JobStatusMap.<docType>.<status>` in <base>/eventworx/resources/locales/de.json.
-# Pull a fresh copy with helpers/fetch_locales.py. This instance is German-only
-# (en.json -> 404), so the English below is our translation of the German UI labels (given
-# in the per-docType comments). The API exposes no display label, so the mapping lives in
-# code; any docType/status not in the table falls back to the raw code (see status_label).
+# `Common.JobStatusMap.<docType>.<status>` in <base>/eventworx/resources/locales/de.json
+# (pull a fresh copy with helpers/fetch_locales.py; the per-docType comments below quote
+# it). Each phrase sticks to that UI label, only bent into a sentence ("Packen" → "wird
+# gepackt"). The API exposes no display label, so the mapping lives in code; any
+# docType/status not in the table gets a generic fallback (see status_phrase).
 # Full per-docType tree and gotchas: eventworx API analysis.md.
-STATUS_LABELS: dict[str, dict[str, str]] = {
+STATUS_PHRASES: dict[str, dict[str, str]] = {
     "order": {  # draft=Entwurf, sent=Bestätigt, open=Offen, finished=Abgeschlossen, cancelled=Storniert
-        "draft": "draft", "sent": "confirmed", "open": "open",
-        "finished": "completed", "cancelled": "cancelled",
+        "draft": "ist im Entwurf", "sent": "ist bestätigt", "open": "ist offen",
+        "finished": "ist abgeschlossen", "cancelled": "wurde storniert",
     },
     "offer": {  # draft=Entwurf, sent=Gesendet, accepted=Angenommen, open=Offen, ordered=Beauftragt, rejected=Abgelehnt
-        "draft": "draft", "sent": "sent", "accepted": "accepted",
-        "open": "open", "ordered": "ordered", "rejected": "rejected",
+        "draft": "ist im Entwurf", "sent": "wurde gesendet", "accepted": "wurde angenommen",
+        "open": "ist offen", "ordered": "wurde beauftragt", "rejected": "wurde abgelehnt",
     },
     "request": {  # draft=Entwurf, sent=Gesendet, offered=Angeboten, accepted=Bestätigt, rejected=Abgelehnt
-        "draft": "draft", "sent": "sent", "offered": "offered",
-        "accepted": "confirmed", "rejected": "rejected",
+        "draft": "ist im Entwurf", "sent": "wurde gesendet", "offered": "wurde angeboten",
+        "accepted": "ist bestätigt", "rejected": "wurde abgelehnt",
     },
     "deliverynote": {  # planning=Entwurf, checkout/picking=Packen, returning=Im Wareneingang,
                        # returned/finished=Ware zurück, completed=Abgeschlossen, open=In Bearbeitung
-        "draft": "draft", "planning": "draft", "checkout": "packing", "picking": "packing",
-        "picked": "packed", "delivered": "delivered", "arrived": "arrived", "open": "in progress",
-        "returning": "receiving", "returned": "returned", "finished": "returned",
-        "partialreturn": "partially returned", "completed": "completed", "overdue": "overdue",
-        "cancelled": "cancelled", "rejected": "cancelled",
+        "draft": "ist im Entwurf", "planning": "ist im Entwurf",
+        "checkout": "wird gepackt", "picking": "wird gepackt", "picked": "ist gepackt",
+        "delivered": "wurde geliefert", "arrived": "ist angekommen",
+        "open": "ist in Bearbeitung", "returning": "ist im Wareneingang",
+        "returned": "ist zurück", "finished": "ist zurück",
+        "partialreturn": "ist teilweise zurück", "completed": "ist abgeschlossen",
+        "overdue": "ist überfällig", "cancelled": "wurde storniert", "rejected": "wurde storniert",
     },
     "invoice": {  # applied=Verrechnet, partiallypaid=Teilzahlung, fullypaid=Bezahlt,
                   # rejected=Storniert, reminding=Gemahnt, overdue=Überfällig
-        "draft": "draft", "open": "open", "applied": "offset",
-        "partiallypaid": "partially paid", "fullypaid": "paid",
-        "rejected": "cancelled", "overdue": "overdue", "reminding": "reminded",
+        "draft": "ist im Entwurf", "open": "ist offen", "applied": "wurde verrechnet",
+        "partiallypaid": "ist teilweise bezahlt", "fullypaid": "ist bezahlt",
+        "rejected": "wurde storniert", "overdue": "ist überfällig", "reminding": "wurde gemahnt",
     },
     # Not produced by this daemon's projects; kept for fallback safety / completeness.
     "clearance": {  # open=In Klärung, rejected=Storniert, finished=Abgeschlossen
-        "open": "under review", "rejected": "cancelled", "finished": "completed",
+        "open": "ist in Klärung", "rejected": "wurde storniert", "finished": "ist abgeschlossen",
     },
     "repair": {  # open=Offen, processing=In Arbeit, rejected=Storniert, finished=Abgeschlossen
-        "open": "open", "processing": "in progress", "rejected": "cancelled", "finished": "completed",
+        "open": "ist offen", "processing": "ist in Arbeit", "rejected": "wurde storniert",
+        "finished": "ist abgeschlossen",
     },
 }
 
 
-def status_label(doc_type: str, status: str) -> str:
-    """Human-readable English label for a raw Eventworx status, scoped by docType.
+def status_phrase(doc_type: str, status: str) -> str:
+    """German predicate phrase for a raw Eventworx status, scoped by docType.
 
     Eventworx returns terse internal codes whose meaning varies by docType (an
-    order's "sent" means confirmed; an offer's "sent" means sent). Falls back to
-    the raw code for any docType/status not covered by STATUS_LABELS.
+    order's "sent" means confirmed; an offer's "sent" means sent). Any
+    docType/status not covered by STATUS_PHRASES falls back to quoting the raw
+    code so the announcement still reads as a sentence.
     """
-    return STATUS_LABELS.get(doc_type, {}).get(status, status)
+    phrase = STATUS_PHRASES.get(doc_type, {}).get(status)
+    return phrase if phrase else f'hat jetzt den Status "{status}"'
 
 
 # --------------- DATA MODELS ---------------
@@ -306,19 +315,19 @@ def _doc_label_and_link(d: Document) -> str:
 def format_doc_created_line(d: Document) -> str:
     """One-line Discord announcement for a newly created document.
 
-    e.g. "Order [AU-1234](<url>) has been created!".
+    e.g. "Auftrag [AU-1234](<url>) wurde erstellt".
     """
-    return f"{_doc_label_and_link(d)} has been created!"
+    return f"{_doc_label_and_link(d)} wurde erstellt"
 
 
 def format_doc_status_changed_line(d: Document) -> str:
     """One-line Discord announcement for a document whose status changed.
 
-    e.g. "Order [AU-1234](<url>) changed its status to confirmed!". The raw
-    Eventworx status code is translated to a friendly per-docType English label
-    via status_label (an order's raw "sent" reads as "confirmed").
+    e.g. "Auftrag [AU-1234](<url>) ist bestätigt". The raw Eventworx status
+    code is translated to a per-docType German predicate phrase via
+    status_phrase (an order's raw "sent" reads as "ist bestätigt").
     """
-    return f"{_doc_label_and_link(d)} changed its status to {status_label(d.docType, d.status)}!"
+    return f"{_doc_label_and_link(d)} {status_phrase(d.docType, d.status)}"
 
 def _first_non_null(docs: list[Document], attr: str):
     """Return the first non-null value for attr, preferring the most recently modified doc."""
@@ -1072,7 +1081,7 @@ def ping_crew_in_thread(thread_id: str,
 
     The role mention is included only when DISCORD_CREW_ROLE_ID is set, but the
     message still posts when `header_lines` carry content — so a brand-new thread's
-    "has been created" announcement is delivered even without a crew role.
+    "wurde erstellt" announcement is delivered even without a crew role.
     """
     lines = list(header_lines or [])
     if DISCORD_CREW_ROLE_ID:
@@ -1223,7 +1232,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     - Active thread in target set with stale name → rename.
 
     When a thread is newly created and `new_docs_by_pn` carries that project's new docs,
-    their "has been created" lines are folded into the thread's combined intro message
+    their "wurde erstellt" lines are folded into the thread's combined intro message
     (above the crew ping). Returns the set of projectNumbers announced this way so the
     caller's announce pass skips them. Also refreshes `state.discord_threads_by_pn`.
     """
@@ -1583,7 +1592,7 @@ def discord_destination(pn: str, p: ProjectSummary, state: SyncState) -> str | N
 
 
 def announce_new_docs(new_docs: list[Document], state: SyncState, announced_pns: set[str]):
-    """Post a "<Type> <job> has been created!" message per newly created document.
+    """Post a "<Typ> <Nummer> wurde erstellt" message per newly created document.
 
     `announced_pns` are projects whose new docs were already folded into a freshly
     created thread's combined intro message — skip them to avoid a duplicate. Docs
@@ -1616,7 +1625,7 @@ def announce_new_docs(new_docs: list[Document], state: SyncState, announced_pns:
 
 
 def announce_status_changes(status_changes: list[Document], state: SyncState):
-    """Post a "<Type> <job> changed its status to X!" message per status transition.
+    """Post a "<Typ> <Nummer> <Status-Phrase>" message per status transition.
 
     Mirrors announce_new_docs' routing: Technikmiete projects → their vermietungen
     thread, everything else → the job channel. Docs whose project has no Discord
