@@ -1,6 +1,6 @@
 # ewxSync
 
-Syncs [Eventworx](https://eventworx.eu) job data into Notion and Discord.
+Syncs [Eventworx](https://www.eventworx.biz/) job data into Notion and Discord.
 
 A long-running daemon polls Eventworx for changes, diffs them against an in-memory mirror, and pushes only what changed: project rows in a Notion database, channel topics in Discord, auto-created channels and threads, and announcement messages for new and status-changed documents.
 
