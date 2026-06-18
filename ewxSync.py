@@ -1223,8 +1223,15 @@ def sync_job_channels(projects: list[ProjectSummary],
     return created
 
 
+# Posted as a thread's last message right before it is archived (project left the
+# Aktiv+Technikmiete target set, e.g. its order was completed/cancelled).
+THREAD_ARCHIVE_NOTICE = "Das Projekt ist nicht mehr aktiv — dieser Thread wird archiviert."
+
+
 def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState",
-                              new_docs_by_pn: dict[str, list[Document]] | None = None) -> set[str]:
+                              new_docs_by_pn: dict[str, list[Document]] | None = None,
+                              status_changes_by_pn: dict[str, list[Document]] | None = None,
+                              ) -> tuple[set[str], set[str]]:
     """Reconcile threads in the vermietungen channel against Aktiv+Technikmiete projects.
 
     - Project in target set, no active thread → unarchive an existing one if found, else create.
@@ -1233,17 +1240,30 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
 
     When a thread is newly created and `new_docs_by_pn` carries that project's new docs,
     their "wurde erstellt" lines are folded into the thread's combined intro message
-    (above the crew ping). Returns the set of projectNumbers announced this way so the
-    caller's announce pass skips them. Also refreshes `state.discord_threads_by_pn`.
+    (above the crew ping).
+
+    When a thread is archived because its project left the target set (e.g. an order
+    was completed), that project's pending announcements — new-doc lines from
+    `new_docs_by_pn` and status-change lines from `status_changes_by_pn` — are posted
+    into the still-active thread first, followed by a silent "wird archiviert" notice,
+    and only then is the thread archived. This keeps the "ist abgeschlossen" update
+    visible in the thread like any other; otherwise it would be dropped, since
+    discord_destination() skips archived threads.
+
+    Returns `(new_announced, status_announced)`: the projectNumbers whose new-doc and
+    status-change announcements, respectively, were already delivered here so the
+    caller's announce passes skip them. Also refreshes `state.discord_threads_by_pn`.
     """
     new_docs_by_pn = new_docs_by_pn or {}
+    status_changes_by_pn = status_changes_by_pn or {}
     announced: set[str] = set()
+    status_announced: set[str] = set()
     prefix = "[DRY-RUN] " if DEBUG else ""
     logging.info("%sChecking vermietungen threads (Aktiv + Technikmiete)…", prefix)
 
     if not DISCORD_VERMIETUNGEN_CHANNEL_ID:
         logging.warning("DISCORD_VERMIETUNGEN_CHANNEL_ID not set — skipping thread sync.")
-        return announced
+        return announced, status_announced
 
     channel_id = DISCORD_VERMIETUNGEN_CHANNEL_ID
     target = {p.projectNumber: p for p in projects
@@ -1342,12 +1362,30 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
                 state.thread_crew_pinged[created.threadId] = True
 
     # Pass 2: archive active threads whose project is no longer in the target set.
+    # Deliver any pending announcements into the still-active thread first (a completed
+    # order's "ist abgeschlossen" should land like any other update), then post a silent
+    # archival notice, then archive. PNs handled here are returned so the caller's
+    # announce passes skip them — otherwise discord_destination() would drop them, the
+    # thread now being archived.
     for pn, t in active_by_pn.items():
         if pn in target:
             continue
+        pending = [format_doc_created_line(d) for d in new_docs_by_pn.get(pn, [])]
+        pending += [format_doc_status_changed_line(d) for d in status_changes_by_pn.get(pn, [])]
+        if pn in new_docs_by_pn:
+            announced.add(pn)
+        if pn in status_changes_by_pn:
+            status_announced.add(pn)
         if DEBUG:
+            for line in pending:
+                logging.info("[DRY-RUN] Would announce in %s: %s", pn, line)
+            logging.info("[DRY-RUN] Would announce archival of thread %s (%s)", pn, t.threadName)
             logging.info("[DRY-RUN] Would archive thread %s (%s)", pn, t.threadName)
         else:
+            for line in pending:
+                post_discord_message(t.threadId, line)
+                logging.info("Announced in %s: %s", pn, line)
+            post_discord_message(t.threadId, THREAD_ARCHIVE_NOTICE)
             archive_thread(t.threadId)
             t.archived = True
             final_state[pn] = t
@@ -1388,7 +1426,7 @@ def sync_vermietungen_threads(projects: list[ProjectSummary], state: "SyncState"
     else:
         save_discord_threads_local(list(final_state.values()))
 
-    return announced
+    return announced, status_announced
 
 
 # ---------------- SYNC PIPELINE ----------------
@@ -1624,17 +1662,23 @@ def announce_new_docs(new_docs: list[Document], state: SyncState, announced_pns:
                      sent, "would-send" if DEBUG else "sent", skipped)
 
 
-def announce_status_changes(status_changes: list[Document], state: SyncState):
+def announce_status_changes(status_changes: list[Document], state: SyncState,
+                            announced_pns: set[str] | None = None):
     """Post a "<Typ> <Nummer> <Status-Phrase>" message per status transition.
 
     Mirrors announce_new_docs' routing: Technikmiete projects → their vermietungen
     thread, everything else → the job channel. Docs whose project has no Discord
-    destination yet are silently skipped. Unlike creations, status changes are never
-    folded into a new thread's intro, so there is no announced_pns skip set here.
+    destination yet are silently skipped. `announced_pns` are projects whose status
+    changes were already posted into a thread by sync_vermietungen_threads right
+    before archiving it — skip them to avoid a duplicate (and because the thread is
+    now archived, discord_destination would drop them anyway).
     """
+    announced_pns = announced_pns or set()
     sent = skipped = 0
     for d in status_changes:
         pn = d.projectNumber
+        if pn in announced_pns:
+            continue
         p = state.projects.get(pn)
         if p is None:
             skipped += 1
@@ -1738,6 +1782,9 @@ def incremental_sync(session, token, state: SyncState,
     new_docs_by_pn: dict[str, list[Document]] = {}
     for d in new_docs:
         new_docs_by_pn.setdefault(d.projectNumber, []).append(d)
+    status_changes_by_pn: dict[str, list[Document]] = {}
+    for d in status_changes:
+        status_changes_by_pn.setdefault(d.projectNumber, []).append(d)
     logging.info("EWX probe: %d changed doc(s) (%d new, %d status change(s)) → %d affected project(s).",
                  len(changed_docs), len(new_docs), len(status_changes), len(affected))
 
@@ -1758,9 +1805,10 @@ def incremental_sync(session, token, state: SyncState,
     # Channels/threads are created here, before announce_new_docs, so a brand-new
     # project's destination exists by the time we post its first message.
     sync_job_channels(list(state.projects.values()), state.discord_by_pn)
-    announced = sync_vermietungen_threads(list(state.projects.values()), state, new_docs_by_pn)
+    announced, status_announced = sync_vermietungen_threads(
+        list(state.projects.values()), state, new_docs_by_pn, status_changes_by_pn)
     announce_new_docs(new_docs, state, announced)
-    announce_status_changes(status_changes, state)
+    announce_status_changes(status_changes, state, status_announced)
 
     save_state_to_disk(state)
     return tick_ms, tick_iso
