@@ -96,7 +96,8 @@ Python 3.10+ required.
 ## Repository layout
 
 - `ewxSync.py`: the daemon. All sync logic lives here.
-- `goals.md`: roadmap and prioritized bugfix backlog.
-- `eventworx API analysis.md`: reverse-engineered notes on Eventworx request shapes, filters, and status vocabularies.
+- `reqs.md`: goals, requirements, and bug backlog (with detail in `reqs/`).
+- `todo.md`: the development plan; each item references the `reqs.md` ID it advances.
+- `docs/`: bulky reference material — reverse-engineered Eventworx notes (`eventworx API analysis.md`) and the frontend job-status store excerpt.
 - `helpers/`: standalone, manually-run scripts (API probes, locale fetch, Discord channel utilities). None are part of the daemon.
 - `cache/`: git-ignored scratch space for generated JSON and JS snapshots. Nothing here is read by the daemon.

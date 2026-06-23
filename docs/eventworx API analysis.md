@@ -289,7 +289,7 @@ If/when that happens, ewxSync could read project status directly instead of (or 
 
 Two takeaways for ewxSync:
 - **`accepted` offers count as live** here (confirms `ACTIVE_OFFER_STATUSES` including `accepted`; the job-management active view's `[draft, open, sent]` lacks it only because it also includes drafts — the two views slice differently and our set is the union).
-- **Every EWX view filters `deleted|* = "false"` server-side.** The daemon receives docs with `activation = "deleted"` through its unfiltered queries and currently treats them as live — confirmed bug, tracked as P2 in `goals.md`.
+- **Every EWX view filters `deleted|* = "false"` server-side.** The daemon receives docs with `activation = "deleted"` through its unfiltered queries and currently treats them as live — confirmed bug, tracked as B4 in `reqs.md`.
 
 ---
 
@@ -301,7 +301,7 @@ Results of a systematic mining pass over `app.pretty.js` for things relevant to 
 
 The Job model documents `docSubType`: *"DocSubType unterscheidet bei einigen Typen. Beispiel: invoice + downpayment or invoicecorrection"*. Observed in the full dump (by `docType, docSubType`): invoice → `finalInvoice` (29), `invoicecorrection` (4), empty (1); repair → `repair`/`service`; all other docTypes empty.
 
-**Risk for ewxSync's invoice price override**: the daemon picks the most recently modified non-cancelled, non-archived invoice — it does not read `docSubType` at all. An `invoicecorrection` (Rechnungskorrektur) with status `applied` is eligible and would win if modified last (near-miss in real data: P-1086's RE-1007 correction was modified within a minute of its sibling final invoice). A `downpayment` invoice (Anzahlung, documented but not yet observed here) would be worse — its `overallPriceValue` is a partial amount. Fix tracked in `goals.md`: capture `docSubType` and restrict the override to `finalInvoice`.
+**Risk for ewxSync's invoice price override**: the daemon picks the most recently modified non-cancelled, non-archived invoice — it does not read `docSubType` at all. An `invoicecorrection` (Rechnungskorrektur) with status `applied` is eligible and would win if modified last (near-miss in real data: P-1086's RE-1007 correction was modified within a minute of its sibling final invoice). A `downpayment` invoice (Anzahlung, documented but not yet observed here) would be worse — its `overallPriceValue` is a partial amount. Fix tracked in `reqs.md` (B9): capture `docSubType` and restrict the override to `finalInvoice`.
 
 ### Solr-queryable field names (server-side) vs. response fields
 
